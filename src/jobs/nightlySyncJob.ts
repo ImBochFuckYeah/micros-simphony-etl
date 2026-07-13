@@ -61,7 +61,10 @@ export const startNightlySyncJob = (): void => {
       try {
         await runIntegrationOnce();
       } catch (error) {
-        console.error("Nightly integration failed", error);
+        console.error("Nightly integration failed", {
+          timestamp: new Date().toISOString(),
+          error: error instanceof Error ? { message: error.message, stack: error.stack } : error
+        });
       }
     },
     {

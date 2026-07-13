@@ -97,30 +97,47 @@ export class SqlServerClient {
         ORDER BY IdFacturaSemanal
       `);
 
-    const result: PendingSale[] = [];
+    const result: PendingSale[] = pendingHeaders.recordset.map((row) => ({
+      idFacturaSemanal: row.IdFacturaSemanal,
+      externalId: row.ExternalId,
+      businessDate: row.BusinessDate,
+      totalAmount: Number(row.TotalAmount),
+      details: []
+    }));
 
-    for (const row of pendingHeaders.recordset) {
-      const detailRows = await this.pool
-        .request()
-        .input("externalId", sql.VarChar(100), row.ExternalId)
-        .query(`
-          SELECT LineNumber, ItemCode, Quantity, LineAmount
-          FROM tFacturaDetalleSemanal
-          WHERE ExternalId = @externalId
-          ORDER BY LineNumber
-        `);
+    if (result.length > 0) {
+      const request = this.pool.request();
+      const placeholders = result.map((_, index) => `@externalId${index}`).join(",");
 
-      result.push({
-        idFacturaSemanal: row.IdFacturaSemanal,
-        externalId: row.ExternalId,
-        businessDate: row.BusinessDate,
-        totalAmount: Number(row.TotalAmount),
-        details: detailRows.recordset.map((detailRow) => ({
+      result.forEach((sale, index) => request.input(`externalId${index}`, sql.VarChar(100), sale.externalId));
+
+      const detailRows = await request.query(`
+        SELECT ExternalId, LineNumber, ItemCode, Quantity, LineAmount
+        FROM tFacturaDetalleSemanal
+        WHERE ExternalId IN (${placeholders})
+        ORDER BY ExternalId, LineNumber
+      `);
+
+      const detailsByExternalId = new Map<string, PendingSale["details"]>();
+      for (const detailRow of detailRows.recordset as Array<{
+        ExternalId: string;
+        LineNumber: number;
+        ItemCode: string;
+        Quantity: number;
+        LineAmount: number;
+      }>) {
+        const details = detailsByExternalId.get(detailRow.ExternalId) ?? [];
+        details.push({
           lineNumber: detailRow.LineNumber,
           itemCode: detailRow.ItemCode,
           quantity: Number(detailRow.Quantity),
           lineAmount: Number(detailRow.LineAmount)
-        }))
+        });
+        detailsByExternalId.set(detailRow.ExternalId, details);
+      }
+
+      result.forEach((sale) => {
+        sale.details = detailsByExternalId.get(sale.externalId) ?? [];
       });
     }
 
