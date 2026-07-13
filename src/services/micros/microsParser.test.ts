@@ -34,3 +34,12 @@ test("parseMicrosSales ignores groups without CHDR", () => {
   assert.equal(parsed.headers.length, 0);
   assert.equal(parsed.details.length, 0);
 });
+
+test("parseMicrosSales generates deterministic fallback externalId", () => {
+  const sample: MicrosJsonExport = [[{ "Record Type": "CHDR", "Business Date": "2026-07-12", "Total Amount": 10 }]];
+
+  const first = parseMicrosSales(sample);
+  const second = parseMicrosSales(sample);
+
+  assert.equal(first.headers[0].externalId, second.headers[0].externalId);
+});

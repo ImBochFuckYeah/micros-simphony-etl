@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   MicrosJsonExport,
   MicrosRecord,
@@ -29,7 +30,7 @@ const buildExternalId = (group: MicrosRecord[], header?: MicrosRecord): string =
     asString(invId?.["Invoice Number"]) ||
     asString(header?.["Check Number"]) ||
     asString(header?.["Invoice Number"]) ||
-    `MICROS-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    `MICROS-${createHash("sha256").update(JSON.stringify(group)).digest("hex").slice(0, 16)}`
   );
 };
 

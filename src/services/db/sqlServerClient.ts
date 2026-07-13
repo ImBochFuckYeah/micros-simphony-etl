@@ -54,8 +54,15 @@ export class SqlServerClient {
           .input("totalAmount", sql.Decimal(18, 2), header.totalAmount)
           .input("rawHeader", sql.NVarChar(sql.MAX), JSON.stringify(header.rawHeader))
           .query(`
-            INSERT INTO tFacturaSemanal (ExternalId, BusinessDate, TotalAmount, RawHeaderJson, SyncStatus)
-            VALUES (@externalId, @businessDate, @totalAmount, @rawHeader, 'PENDING')
+            IF NOT EXISTS (
+              SELECT 1
+              FROM tFacturaSemanal
+              WHERE ExternalId = @externalId
+            )
+            BEGIN
+              INSERT INTO tFacturaSemanal (ExternalId, BusinessDate, TotalAmount, RawHeaderJson, SyncStatus)
+              VALUES (@externalId, @businessDate, @totalAmount, @rawHeader, 'PENDING')
+            END
           `);
       }
 
@@ -68,8 +75,16 @@ export class SqlServerClient {
           .input("lineAmount", sql.Decimal(18, 2), detail.lineAmount)
           .input("rawDetail", sql.NVarChar(sql.MAX), JSON.stringify(detail.rawDetail))
           .query(`
-            INSERT INTO tFacturaDetalleSemanal (ExternalId, LineNumber, ItemCode, Quantity, LineAmount, RawDetailJson)
-            VALUES (@externalId, @lineNumber, @itemCode, @quantity, @lineAmount, @rawDetail)
+            IF NOT EXISTS (
+              SELECT 1
+              FROM tFacturaDetalleSemanal
+              WHERE ExternalId = @externalId
+                AND LineNumber = @lineNumber
+            )
+            BEGIN
+              INSERT INTO tFacturaDetalleSemanal (ExternalId, LineNumber, ItemCode, Quantity, LineAmount, RawDetailJson)
+              VALUES (@externalId, @lineNumber, @itemCode, @quantity, @lineAmount, @rawDetail)
+            END
           `);
       }
 

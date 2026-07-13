@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import cron from "node-cron";
 import { appConfig } from "../config/env.js";
 import { SqlServerClient, type PendingSale } from "../services/db/sqlServerClient.js";
+import { logger } from "../services/logger.js";
 import { parseMicrosSales } from "../services/micros/microsParser.js";
 import { SapServiceLayerClient, type SapSalePayload } from "../services/sap/sapServiceLayerClient.js";
 import { MicrosSftpService } from "../services/sftp/sftpClient.js";
@@ -61,8 +62,7 @@ export const startNightlySyncJob = (): void => {
       try {
         await runIntegrationOnce();
       } catch (error) {
-        console.error("Nightly integration failed", {
-          timestamp: new Date().toISOString(),
+        logger.error("Nightly integration failed", {
           error: error instanceof Error ? { message: error.message, stack: error.stack } : error
         });
       }
