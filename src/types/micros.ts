@@ -18,6 +18,7 @@ export interface ParsedInvoiceDetail {
   externalId: string;
   lineNumber: number;
   itemCode: string;
+  itemDescription: string;
   quantity: number;
   lineAmount: number;
   rawDetail: MicrosRecord;

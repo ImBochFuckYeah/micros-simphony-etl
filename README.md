@@ -33,7 +33,16 @@ npm run lint
 npm run test
 npm run build
 npm run dev
+npm run manual-sync
+npm run manual-full-sync
 ```
+
+`npm run dev` inicia el scheduler (cron) para procesar facturas pendientes hacia SAP.
+`npm run manual-sync` ejecuta una corrida única solo para procesar facturas pendientes hacia SAP.
+`npm run manual-full-sync` ejecuta una corrida completa: SFTP + parseo + SQL + SAP.
+
+Para ver logs de inserciones en SQL Server (`tFacturaSemanal` y `tFacturaDetalleSemanal`), define `ETL_DEBUG_SQL=true` en `.env`.
+Para ver logs de solicitudes/respuestas hacia SAP (sin exponer password/cookies), define `ETL_DEBUG_SAP=true` en `.env`.
 
 ## Cron
 

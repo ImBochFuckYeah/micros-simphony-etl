@@ -39,6 +39,8 @@ export const appConfig = {
     baseUrl: required("SAP_BASE_URL"),
     companyDB: required("SAP_COMPANY_DB"),
     username: required("SAP_USERNAME"),
-    password: required("SAP_PASSWORD")
+    password: required("SAP_PASSWORD"),
+    allowSelfSignedCert: process.env.SAP_ALLOW_SELF_SIGNED_CERT === "true",
+    debugRequests: process.env.ETL_DEBUG_SAP === "true"
   } satisfies SapServiceLayerConfig
 };

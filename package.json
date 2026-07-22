@@ -7,6 +7,8 @@
     "test": "tsx --test src/**/*.test.ts",
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/app.ts",
+    "manual-sync": "tsx -e \"import { runIntegrationOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await runIntegrationOnce(); })();\"",
+    "manual-full-sync": "tsx -e \"import { runIntegrationOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await runIntegrationOnce(); })();\"",
     "start": "node dist/app.js",
     "lint": "tsc --noEmit -p tsconfig.json"
   },
