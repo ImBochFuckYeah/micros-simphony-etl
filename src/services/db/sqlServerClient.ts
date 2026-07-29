@@ -130,6 +130,12 @@ export interface FacturaSemanalEntity {
   indendificador: string;
 }
 
+interface StoreLocation {
+  empresa: string;
+  tienda: string;
+  storeNumberSimphony: string;
+}
+
 export interface FacturaDetalleSemanalEntity {
   idFacturaDetalle?: number;
   idFactura: number;
@@ -146,11 +152,11 @@ const mapHeaderToFacturaSemanal = (header: ParsedInvoiceHeader): FacturaSemanalE
 
   return {
     empresa: truncate(
-      pickFirstString(rawHeader, ["Revenue Center Number", "Company", "Enterprise", "Property", "Property Code"], "00001"),
+      pickFirstString(rawHeader, ["Revenue Center Number", "Company", "Enterprise", "Property", "Property Code"], "N/A"),
       HEADER_MAX_LENGTHS.empresa
     ),
     tienda: truncate(
-      pickFirstString(rawHeader, ["Revenue Center Number", "Store", "Revenue Center", "Location", "Outlet"], "00095"),
+      pickFirstString(rawHeader, ["Revenue Center Number", "Store", "Revenue Center", "Location", "Outlet"], "N/A"),
       HEADER_MAX_LENGTHS.tienda
     ),
     idFacturaPOS: pickFirstNumber(rawHeader, ["Check Number", "Invoice Number", "Check ID"], buildFacturaPosId(header.externalId)),
@@ -176,6 +182,23 @@ const mapHeaderToFacturaSemanal = (header: ParsedInvoiceHeader): FacturaSemanalE
     sincronizado: false,
     uuidFactura: truncate(header.externalId, HEADER_MAX_LENGTHS.uuidFactura),
     indendificador: truncate(header.externalId, HEADER_MAX_LENGTHS.indendificador)
+  };
+};
+
+const mapHeaderToFacturaSemanalWithStore = (
+  header: ParsedInvoiceHeader,
+  storeLocation: StoreLocation | null
+): FacturaSemanalEntity => {
+  const factura = mapHeaderToFacturaSemanal(header);
+
+  if (!storeLocation) {
+    return factura;
+  }
+
+  return {
+    ...factura,
+    empresa: truncate(storeLocation.empresa || factura.empresa, HEADER_MAX_LENGTHS.empresa),
+    tienda: truncate(storeLocation.tienda || factura.tienda, HEADER_MAX_LENGTHS.tienda)
   };
 };
 
@@ -221,6 +244,24 @@ export interface PendingSale {
   }>;
 }
 
+export interface PendingSapDocumentLine {
+  sku: string;
+  quantity: number;
+  unitPrice: number;
+  lineTotal: number;
+}
+
+export interface PendingSapDocument {
+  businessDate: string;
+  empresa: string;
+  tienda: string;
+  cardCode: string;
+  warehouseCode: string;
+  externalId: string;
+  sourceHeaderIds: number[];
+  lines: PendingSapDocumentLine[];
+}
+
 export interface InsertSalesResult {
   insertedHeaders: number;
   skippedHeaders: number;
@@ -262,12 +303,24 @@ export class SqlServerClient {
     try {
       const headerIdsByExternalId = new Map<string, number>();
       const insertedExternalIds = new Set<string>();
+      const storeLocationByNumber = new Map<string, StoreLocation | null>();
 
       for (const header of headers) {
-        const factura = mapHeaderToFacturaSemanal(header);
+        const storeNumberSimphony = header.storeNumberSimphony.trim();
+        let storeLocation = storeLocationByNumber.get(storeNumberSimphony);
+
+        if (!storeLocationByNumber.has(storeNumberSimphony)) {
+          storeLocation = storeNumberSimphony ? await this.findStoreLocation(storeNumberSimphony) : null;
+          storeLocationByNumber.set(storeNumberSimphony, storeLocation);
+        }
+
+        const factura = mapHeaderToFacturaSemanalWithStore(header, storeLocation ?? null);
 
         logSqlDebug("Attempting upsert in tFacturaSemanal", {
           externalId: header.externalId,
+          storeNumberSimphony,
+          matchedEmpresa: storeLocation?.empresa ?? null,
+          matchedTienda: storeLocation?.tienda ?? null,
           indendificador: factura.indendificador,
           total: factura.total,
           fechaHora: factura.fechaHora.toISOString()
@@ -495,6 +548,112 @@ export class SqlServerClient {
     return result;
   }
 
+  async getPendingSapDocumentsForToday(): Promise<PendingSapDocument[]> {
+    if (!this.pool) throw new Error("SQL Server connection is not initialized");
+
+    const headerRows = await this.pool.request().query(`
+      SELECT
+        f.idFactura,
+        CONVERT(date, f.fechaHora) AS businessDate,
+        f.empresa,
+        f.tienda,
+        t.clienteSAP,
+        t.whsCode
+      FROM tFacturaSemanal AS f
+      INNER JOIN tTienda AS t
+        ON t.empresa = f.empresa
+       AND t.tienda = f.tienda
+      WHERE CONVERT(date, f.fechaHora) = CONVERT(date, GETDATE() - 1)
+        AND f.numSAP IS NULL
+        AND f.empresa = '00001'
+        AND f.tienda = '00095'
+      ORDER BY f.idFactura
+    `);
+
+    const groupedDocuments = new Map<string, PendingSapDocument>();
+
+    for (const row of headerRows.recordset as Array<{
+      idFactura: number;
+      businessDate: Date;
+      empresa: string;
+      tienda: string;
+      clienteSAP: string | null;
+      whsCode: string | null;
+    }>) {
+      const cardCode = asString(row.clienteSAP);
+      const warehouseCode = asString(row.whsCode);
+      if (!cardCode || !warehouseCode) {
+        throw new Error(
+          `Missing clienteSAP/whsCode in tTienda for empresa ${row.empresa} and tienda ${row.tienda} (idFactura ${row.idFactura})`
+        );
+      }
+
+      const businessDate = formatBusinessDate(row.businessDate);
+      const groupKey = `${businessDate}|${row.empresa}|${row.tienda}`;
+      const existing = groupedDocuments.get(groupKey);
+
+      if (existing) {
+        existing.sourceHeaderIds.push(row.idFactura);
+      } else {
+        groupedDocuments.set(groupKey, {
+          businessDate,
+          empresa: row.empresa,
+          tienda: row.tienda,
+          cardCode,
+          warehouseCode,
+          externalId: `MICROS-${businessDate}-${row.empresa}-${row.tienda}`,
+          sourceHeaderIds: [row.idFactura],
+          lines: []
+        });
+      }
+    }
+
+    const pendingDocuments = Array.from(groupedDocuments.values());
+    for (const document of pendingDocuments) {
+      const request = this.pool.request();
+      const placeholders = document.sourceHeaderIds.map((_, index) => `@idFactura${index}`).join(",");
+      document.sourceHeaderIds.forEach((id, index) => request.input(`idFactura${index}`, sql.Int, id));
+
+      const detailRows = await request.query(`
+        SELECT
+          sku,
+          precio,
+          SUM(cantidad) AS quantity,
+          SUM(total) AS lineTotal
+        FROM tFacturaDetalleSemanal
+        WHERE idFactura IN (${placeholders}) AND precio > 0 AND cantidad > 0
+        GROUP BY sku, precio
+        ORDER BY sku, precio
+      `);
+
+      document.lines = (detailRows.recordset as Array<{ sku: string; precio: number; quantity: number; lineTotal: number }>).map((row) => ({
+        sku: asString(row.sku),
+        quantity: roundTo(Number(row.quantity), 2),
+        unitPrice: roundTo(Number(row.precio), 2),
+        lineTotal: roundTo(Number(row.lineTotal), 2)
+      }));
+    }
+
+    return pendingDocuments.filter((document) => document.lines.length > 0);
+  }
+
+  async markSapDocumentNumber(ids: number[], docNum: number): Promise<void> {
+    if (!this.pool || ids.length === 0) return;
+
+    const request = this.pool.request();
+    const placeholders = ids.map((_, index) => `@id${index}`).join(",");
+
+    ids.forEach((id, index) => request.input(`id${index}`, sql.Int, id));
+    request.input("docNum", sql.Int, docNum);
+
+    await request.query(`
+      UPDATE tFacturaSemanal
+      SET numSAP = @docNum,
+          sincronizado = 1
+      WHERE idFactura IN (${placeholders})
+    `);
+  }
+
   async markSalesAsSynced(ids: number[]): Promise<void> {
     if (!this.pool || ids.length === 0) return;
 
@@ -508,5 +667,30 @@ export class SqlServerClient {
       SET sincronizado = 1
       WHERE idFactura IN (${placeholders})
     `);
+  }
+
+  private async findStoreLocation(storeNumberSimphony: string): Promise<StoreLocation | null> {
+    if (!this.pool || !storeNumberSimphony) return null;
+
+    const result = await this.pool
+      .request()
+      .input("storeNumberSimphony", sql.VarChar(50), storeNumberSimphony)
+      .query(`
+        SELECT TOP 1
+          empresa,
+          tienda,
+          StoreNumberSimphony
+        FROM tTienda
+        WHERE StoreNumberSimphony = @storeNumberSimphony
+      `);
+
+    const row = result.recordset[0] as { empresa: string; tienda: string; StoreNumberSimphony: string } | undefined;
+    if (!row) return null;
+
+    return {
+      empresa: row.empresa,
+      tienda: row.tienda,
+      storeNumberSimphony: row.StoreNumberSimphony
+    };
   }
 }

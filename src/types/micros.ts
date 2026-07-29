@@ -9,6 +9,7 @@ export type MicrosJsonExport = MicrosRecord[][];
 
 export interface ParsedInvoiceHeader {
   externalId: string;
+  storeNumberSimphony: string;
   businessDate: string;
   totalAmount: number;
   rawHeader: MicrosRecord;

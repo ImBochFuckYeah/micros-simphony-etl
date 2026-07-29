@@ -17,6 +17,8 @@ const required = (key: string): string => {
 export const appConfig = {
   cronExpression: process.env.CRON_EXPRESSION ?? "0 23 * * *",
   cronTimezone: process.env.CRON_TIMEZONE ?? "America/Mexico_City",
+  strictSapItemMapping: process.env.SAP_STRICT_ITEM_MAPPING === "true",
+  sapInvoiceSeries: Number(process.env.SAP_INVOICE_SERIES ?? "144"),
   sftp: {
     host: required("SFTP_HOST"),
     port: Number(process.env.SFTP_PORT ?? "22"),

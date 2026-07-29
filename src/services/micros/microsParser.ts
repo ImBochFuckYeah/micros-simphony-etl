@@ -97,6 +97,11 @@ const buildProductCatalog = (recordsByType: Map<string, MicrosRecord[]>): Map<st
   return catalog;
 };
 
+const getStoreNumberSimphony = (recordsByType: Map<string, MicrosRecord[]>): string => {
+  const glidRecord = recordsByType.get("GLID")?.[0];
+  return asLookupKey(glidRecord?.["Store Number"]);
+};
+
 const extractDetailDescription = (detailRecord: MicrosRecord, fallback = ""): string =>
   asScalarString(detailRecord["Description"]) ||
   asScalarString(detailRecord["Descripcion"]) ||
@@ -162,6 +167,7 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
   }
 
   const productCatalog = buildProductCatalog(recordsByType);
+  const storeNumberSimphony = getStoreNumberSimphony(recordsByType);
   const headerRecords = recordsByType.get("CHDR") ?? [];
   const cmiByKey = new Map<string, MicrosRecord[]>();
   const cdtlByKey = new Map<string, MicrosRecord[]>();
@@ -194,6 +200,7 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
 
     headers.push({
       externalId,
+      storeNumberSimphony,
       businessDate: asDateString(header["Close Business Date"] ?? header["Open Business Date"] ?? header["Business Date"]),
       totalAmount,
       rawHeader: header
@@ -265,6 +272,7 @@ export const parseMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSale
   }
 
   const productCatalog = buildProductCatalog(recordsByType);
+  const storeNumberSimphony = getStoreNumberSimphony(recordsByType);
 
   if (
     microsJson.length > 0 &&
@@ -287,6 +295,7 @@ export const parseMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSale
 
     headers.push({
       externalId,
+      storeNumberSimphony,
       businessDate: asString(header["Business Date"]),
       totalAmount: asNumber(header["Total Amount"]),
       rawHeader: header

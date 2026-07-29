@@ -49,6 +49,12 @@ test("parseMicrosSales supports type-bucketed RA exports", () => {
   const sample: MicrosJsonExport = [
     [
       {
+        "Record Type": "GLID",
+        "Store Number": "Lab9999"
+      }
+    ],
+    [
+      {
         "Record Type": "CHDR",
         "Revenue Center Number": 101,
         "Order Type Number": 2,
@@ -104,6 +110,7 @@ test("parseMicrosSales supports type-bucketed RA exports", () => {
 
   assert.equal(parsed.headers.length, 1);
   assert.equal(parsed.headers[0].externalId, "MICROS-CHDR-20260709-101-2-13063");
+  assert.equal(parsed.headers[0].storeNumberSimphony, "Lab9999");
   assert.equal(parsed.headers[0].businessDate, "2026-07-09");
   assert.equal(parsed.details.length, 2);
   assert.equal(parsed.details[0].itemCode, "103009");

@@ -7,14 +7,32 @@ interface SapSessionResponse {
 }
 
 export interface SapSalePayload {
+  CardCode: string;
+  Series?: number;
   U_MICROS_ExternalId: string;
   DocDate: string;
-  DocTotal: number;
+  DocDueDate?: string;
+  ReserveInvoice?: "tYES" | "tNO";
+  Comments?: string;
   DocumentLines: Array<{
     ItemCode: string;
     Quantity: number;
-    LineTotal: number;
+    PriceAfterVAT: number;
+    WarehouseCode: string;
   }>;
+}
+
+export interface SapPostedDocument {
+  DocEntry: number;
+  DocNum: number;
+}
+
+interface SapItemsResponse {
+  value: Array<{
+    ItemCode: string;
+    U_ID_SIMPHONY: string | null;
+  }>;
+  "@odata.nextLink"?: string;
 }
 
 export interface SapServiceLayerConfig {
@@ -82,14 +100,13 @@ export class SapServiceLayerClient {
     this.sessionCookie = relevantCookies.join("; ");
   }
 
-  async postSale(payload: SapSalePayload): Promise<void> {
+  async postSale(payload: SapSalePayload): Promise<SapPostedDocument> {
     await this.ensureAuthenticated();
 
     this.debug("SAP invoice request", {
       url: "/Invoices",
       externalId: payload.U_MICROS_ExternalId,
       docDate: payload.DocDate,
-      docTotal: payload.DocTotal,
       lineCount: payload.DocumentLines.length
     });
 
@@ -102,6 +119,8 @@ export class SapServiceLayerClient {
         status: response.status,
         externalId: payload.U_MICROS_ExternalId
       });
+
+      return this.extractPostedDocument(response.data);
     } catch (error) {
       if (this.isUnauthorized(error)) {
         this.debug("SAP invoice unauthorized, retrying login", {
@@ -116,7 +135,7 @@ export class SapServiceLayerClient {
           status: retryResponse.status,
           externalId: payload.U_MICROS_ExternalId
         });
-        return;
+        return this.extractPostedDocument(retryResponse.data);
       }
 
       if (error instanceof AxiosError) {
@@ -131,6 +150,46 @@ export class SapServiceLayerClient {
 
       throw error;
     }
+  }
+
+  async getSalesItemsBySimphonyId(): Promise<Map<string, string>> {
+    await this.ensureAuthenticated();
+
+    const itemsBySimphonyId = new Map<string, string>();
+    const basePath = "/Items?$select=ItemCode,ItemName,U_ID_SIMPHONY&$filter=U_ID_SIMPHONY ne null";
+    let nextPath = basePath;
+    let fallbackSkip = 0;
+    const defaultPageSize = 20;
+
+    while (true) {
+      const response = await this.http.get<SapItemsResponse>(nextPath, {
+        headers: { Cookie: this.sessionCookie }
+      });
+
+      const pageItems = response.data.value ?? [];
+      for (const item of pageItems) {
+        const simphonyId = item.U_ID_SIMPHONY?.trim();
+        if (!simphonyId) continue;
+        if (!itemsBySimphonyId.has(simphonyId)) {
+          itemsBySimphonyId.set(simphonyId, item.ItemCode);
+        }
+      }
+
+      const nextLink = response.data["@odata.nextLink"];
+      if (nextLink) {
+        nextPath = `/${nextLink.replace(/^\/+/, "")}`;
+        continue;
+      }
+
+      if (pageItems.length < defaultPageSize) {
+        break;
+      }
+
+      fallbackSkip += defaultPageSize;
+      nextPath = `${basePath}&$skip=${fallbackSkip}`;
+    }
+
+    return itemsBySimphonyId;
   }
 
   async logout(): Promise<void> {
@@ -161,6 +220,21 @@ export class SapServiceLayerClient {
 
   private isUnauthorized(error: unknown): error is AxiosError {
     return error instanceof AxiosError && error.response?.status === 401;
+  }
+
+  private extractPostedDocument(data: unknown): SapPostedDocument {
+    const payload = data as { DocEntry?: unknown; DocNum?: unknown };
+    const docEntry = typeof payload.DocEntry === "number" ? payload.DocEntry : Number(payload.DocEntry);
+    const docNum = typeof payload.DocNum === "number" ? payload.DocNum : Number(payload.DocNum);
+
+    if (!Number.isFinite(docEntry) || !Number.isFinite(docNum)) {
+      throw new Error(`SAP invoice response did not include DocEntry/DocNum: ${JSON.stringify(data)}`);
+    }
+
+    return {
+      DocEntry: docEntry,
+      DocNum: docNum
+    };
   }
 
   private debug(message: string, context?: Record<string, unknown>): void {
