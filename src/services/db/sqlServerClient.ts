@@ -548,10 +548,14 @@ export class SqlServerClient {
     return result;
   }
 
-  async getPendingSapDocumentsForToday(): Promise<PendingSapDocument[]> {
+  async getPendingSapDocumentsByDateRange(startDate: string, endDate: string): Promise<PendingSapDocument[]> {
     if (!this.pool) throw new Error("SQL Server connection is not initialized");
 
-    const headerRows = await this.pool.request().query(`
+    const headerRows = await this.pool
+      .request()
+      .input("startDate", sql.Date, new Date(`${startDate}T00:00:00`))
+      .input("endDate", sql.Date, new Date(`${endDate}T00:00:00`))
+      .query(`
       SELECT
         f.idFactura,
         CONVERT(date, f.fechaHora) AS businessDate,
@@ -563,7 +567,7 @@ export class SqlServerClient {
       INNER JOIN tTienda AS t
         ON t.empresa = f.empresa
        AND t.tienda = f.tienda
-      WHERE CONVERT(date, f.fechaHora) = CONVERT(date, GETDATE() - 1)
+      WHERE CONVERT(date, f.fechaHora) BETWEEN @startDate AND @endDate
         AND f.numSAP IS NULL
         AND f.empresa = '00001'
         AND f.tienda = '00095'
@@ -635,6 +639,11 @@ export class SqlServerClient {
     }
 
     return pendingDocuments.filter((document) => document.lines.length > 0);
+  }
+
+  async getPendingSapDocumentsForToday(): Promise<PendingSapDocument[]> {
+    const today = formatBusinessDate(new Date());
+    return this.getPendingSapDocumentsByDateRange(today, today);
   }
 
   async markSapDocumentNumber(ids: number[], docNum: number): Promise<void> {

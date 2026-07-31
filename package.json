@@ -7,9 +7,10 @@
     "test": "tsx --test src/**/*.test.ts",
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/app.ts",
-    "manual-sync": "tsx -e \"import { processMicrosFilesOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await processMicrosFilesOnce(); })();\"",
-    "manual-sap-sync": "tsx -e \"import { processPendingInvoicesInSapOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await processPendingInvoicesInSapOnce(); })();\"",
-    "manual-full-sync": "tsx -e \"import { runFullIntegrationOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await runFullIntegrationOnce(); })();\"",
+    "manual-sync": "tsx -e \"import { processMicrosFilesOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await processMicrosFilesOnce(process.env.START_DATE, process.env.END_DATE); })();\"",
+    "manual-sap-sync": "tsx -e \"import { processPendingInvoicesInSapOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await processPendingInvoicesInSapOnce(process.env.START_DATE, process.env.END_DATE); })();\"",
+    "manual-pedidos-sync": "tsx -e \"import { processPedidosFilesOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await processPedidosFilesOnce(process.env.START_DATE, process.env.END_DATE); })();\"",
+    "manual-full-sync": "tsx -e \"import { runFullIntegrationOnce } from './src/jobs/nightlySyncJob.ts'; (async () => { await runFullIntegrationOnce(process.env.START_DATE, process.env.END_DATE); })();\"",
     "start": "node dist/app.js",
     "lint": "tsc --noEmit -p tsconfig.json"
   },
@@ -29,11 +30,13 @@
     "dotenv": "^16.4.5",
     "mssql": "^11.0.1",
     "node-cron": "^4.2.1",
+    "pg": "^8.22.0",
     "ssh2-sftp-client": "^12.0.1"
   },
   "devDependencies": {
     "@types/mssql": "^9.1.7",
     "@types/node": "^22.10.1",
+    "@types/pg": "^8.20.0",
     "@types/ssh2-sftp-client": "^9.0.5",
     "tsx": "^4.23.1",
     "typescript": "^5.6.3"

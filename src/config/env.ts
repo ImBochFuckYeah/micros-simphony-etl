@@ -1,5 +1,7 @@
 import path from "node:path";
 import dotenv from "dotenv";
+import type { MiddlewareDbConfig } from "../services/db/middlewareClient.js";
+import type { PedidoApiConfig } from "../services/pedidos/pedidoApiClient.js";
 import type { SapServiceLayerConfig } from "../services/sap/sapServiceLayerClient.js";
 import type { SqlServerConfig } from "../services/db/sqlServerClient.js";
 import type { SftpConfig } from "../services/sftp/sftpClient.js";
@@ -25,8 +27,15 @@ export const appConfig = {
     username: required("SFTP_USERNAME"),
     password: required("SFTP_PASSWORD"),
     remoteDir: required("SFTP_REMOTE_DIR"),
-    localDir: process.env.SFTP_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "micros")
+    localDir: process.env.SFTP_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "micros"),
+    pedidosRemoteDir: process.env.SFTP_PEDIDOS_REMOTE_DIR,
+    pedidosLocalDir: process.env.SFTP_PEDIDOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "pedidos")
   } satisfies SftpConfig,
+  pedidosApi: {
+    uploadUrl: required("PEDIDOS_API_UPLOAD_URL"),
+    timeoutMs: Number(process.env.PEDIDOS_API_TIMEOUT_MS ?? "20000"),
+    debugRequests: process.env.ETL_DEBUG_PEDIDOS_API === "true"
+  } satisfies PedidoApiConfig,
   sqlServer: {
     user: required("SQL_USER"),
     password: required("SQL_PASSWORD"),
@@ -44,5 +53,14 @@ export const appConfig = {
     password: required("SAP_PASSWORD"),
     allowSelfSignedCert: process.env.SAP_ALLOW_SELF_SIGNED_CERT === "true",
     debugRequests: process.env.ETL_DEBUG_SAP === "true"
-  } satisfies SapServiceLayerConfig
+  } satisfies SapServiceLayerConfig,
+  middlewareDb: {
+    host: required("MIDDLEWARE_DB_HOST"),
+    port: Number(process.env.MIDDLEWARE_DB_PORT ?? "5432"),
+    database: process.env.MIDDLEWARE_DB_NAME ?? "micros_middleware_dev",
+    user: required("MIDDLEWARE_DB_USER"),
+    password: required("MIDDLEWARE_DB_PASSWORD"),
+    sslEnabled: process.env.MIDDLEWARE_DB_SSL_ENABLED !== "false",
+    sslRejectUnauthorized: process.env.MIDDLEWARE_DB_SSL_REJECT_UNAUTHORIZED !== "false"
+  } satisfies MiddlewareDbConfig
 };
