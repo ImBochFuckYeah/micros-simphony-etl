@@ -101,7 +101,13 @@ const buildFacturaPosId = (externalId: string): number => {
 };
 
 const parseBusinessDate = (businessDate: string): Date => {
-  const candidate = new Date(`${businessDate}T00:00:00`);
+  const normalizedBusinessDate = businessDate.trim();
+  const compactDigits = normalizedBusinessDate.replace(/\D/g, "");
+  const datePortion =
+    compactDigits.length >= 8
+      ? `${compactDigits.slice(0, 4)}-${compactDigits.slice(4, 6)}-${compactDigits.slice(6, 8)}`
+      : normalizedBusinessDate;
+  const candidate = new Date(`${datePortion}T00:00:00`);
   return Number.isNaN(candidate.getTime()) ? new Date() : candidate;
 };
 
@@ -134,6 +140,16 @@ interface StoreLocation {
   empresa: string;
   tienda: string;
   storeNumberSimphony: string;
+  enableUploadingDocuments: boolean;
+}
+
+export interface StoreSapInventoryConfig {
+  empresa: string;
+  tienda: string;
+  storeNumberSimphony: string;
+  warehouseCode: string;
+  costingCode: string;
+  enableUploadingDocuments: boolean;
 }
 
 export interface FacturaDetalleSemanalEntity {
@@ -314,7 +330,17 @@ export class SqlServerClient {
           storeLocationByNumber.set(storeNumberSimphony, storeLocation);
         }
 
-        const factura = mapHeaderToFacturaSemanalWithStore(header, storeLocation ?? null);
+        if (!storeLocation?.enableUploadingDocuments) {
+          stats.skippedHeaders += 1;
+          logSqlDebug("Skipped MICROS header because its store is not enabled for document upload", {
+            externalId: header.externalId,
+            storeNumberSimphony,
+            storeFound: Boolean(storeLocation)
+          });
+          continue;
+        }
+
+        const factura = mapHeaderToFacturaSemanalWithStore(header, storeLocation);
 
         logSqlDebug("Attempting upsert in tFacturaSemanal", {
           externalId: header.externalId,
@@ -569,8 +595,7 @@ export class SqlServerClient {
        AND t.tienda = f.tienda
       WHERE CONVERT(date, f.fechaHora) BETWEEN @startDate AND @endDate
         AND f.numSAP IS NULL
-        AND f.empresa = '00001'
-        AND f.tienda = '00095'
+        AND t.EnableUploadingDocuments = 1
       ORDER BY f.idFactura
     `);
 
@@ -678,6 +703,51 @@ export class SqlServerClient {
     `);
   }
 
+  async getStoreSapInventoryConfigBySimphonyStoreNumber(
+    storeNumberSimphony: string
+  ): Promise<StoreSapInventoryConfig | null> {
+    if (!this.pool || !storeNumberSimphony.trim()) {
+      return null;
+    }
+
+    const result = await this.pool
+      .request()
+      .input("storeNumberSimphony", sql.VarChar(50), storeNumberSimphony.trim())
+      .query(`
+        SELECT TOP 1
+          empresa,
+          tienda,
+          StoreNumberSimphony,
+          whsCode,
+          costingCode,
+          EnableUploadingDocuments
+        FROM tTienda
+        WHERE StoreNumberSimphony = @storeNumberSimphony
+      `);
+
+    const row = result.recordset[0] as {
+      empresa: string;
+      tienda: string;
+      StoreNumberSimphony: string;
+      whsCode: string | null;
+      costingCode: string | null;
+      EnableUploadingDocuments: boolean;
+    } | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      empresa: row.empresa,
+      tienda: row.tienda,
+      storeNumberSimphony: row.StoreNumberSimphony,
+      warehouseCode: asString(row.whsCode),
+      costingCode: asString(row.costingCode),
+      enableUploadingDocuments: row.EnableUploadingDocuments === true
+    };
+  }
+
   private async findStoreLocation(storeNumberSimphony: string): Promise<StoreLocation | null> {
     if (!this.pool || !storeNumberSimphony) return null;
 
@@ -688,18 +758,25 @@ export class SqlServerClient {
         SELECT TOP 1
           empresa,
           tienda,
-          StoreNumberSimphony
+          StoreNumberSimphony,
+          EnableUploadingDocuments
         FROM tTienda
         WHERE StoreNumberSimphony = @storeNumberSimphony
       `);
 
-    const row = result.recordset[0] as { empresa: string; tienda: string; StoreNumberSimphony: string } | undefined;
+    const row = result.recordset[0] as {
+      empresa: string;
+      tienda: string;
+      StoreNumberSimphony: string;
+      EnableUploadingDocuments: boolean;
+    } | undefined;
     if (!row) return null;
 
     return {
       empresa: row.empresa,
       tienda: row.tienda,
-      storeNumberSimphony: row.StoreNumberSimphony
+      storeNumberSimphony: row.StoreNumberSimphony,
+      enableUploadingDocuments: row.EnableUploadingDocuments === true
     };
   }
 }

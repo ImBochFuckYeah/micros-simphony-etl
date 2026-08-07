@@ -40,6 +40,17 @@ const asDateString = (value: unknown): string => {
   return raw;
 };
 
+const pickFirstNonEmptyValue = (record: MicrosRecord | undefined, keys: string[]): string => {
+  for (const key of keys) {
+    const value = asScalarString(record?.[key]).trim();
+    if (value) {
+      return value;
+    }
+  }
+
+  return "";
+};
+
 const recordTypeOf = (record: MicrosRecord | undefined): string => asString(record?.["Record Type"]);
 
 const isHomogeneousGroup = (group: MicrosRecord[]): boolean => {
@@ -193,6 +204,9 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
     const cdtlDetails = cdtlByKey.get(key) ?? [];
     const bucketDetails = cmiDetails.length > 0 ? cmiDetails : cdtlDetails;
     const totalAmount = asNumber(header["Check Total"], asNumber(header["Total Amount"]));
+    const businessDate = asDateString(
+      pickFirstNonEmptyValue(header, ["Close Business Date", "Open Business Date", "Business Date"])
+    );
 
     if (bucketDetails.length === 0 && totalAmount === 0) {
       continue;
@@ -201,7 +215,7 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
     headers.push({
       externalId,
       storeNumberSimphony,
-      businessDate: asDateString(header["Close Business Date"] ?? header["Open Business Date"] ?? header["Business Date"]),
+      businessDate,
       totalAmount,
       rawHeader: header
     });
@@ -229,9 +243,10 @@ const buildExternalId = (group: MicrosRecord[], header?: MicrosRecord): string =
 
   const recordType = normalizeIdSegment(recordTypeOf(sourceHeader) || "CHDR", "CHDR");
   const businessDate = normalizeIdSegment(
-    asDateString(
-      sourceHeader?.["Close Business Date"] ?? sourceHeader?.["Open Business Date"] ?? sourceHeader?.["Business Date"]
-    ).replace(/-/g, ""),
+    asDateString(pickFirstNonEmptyValue(sourceHeader, ["Close Business Date", "Open Business Date", "Business Date"])).replace(
+      /-/g,
+      ""
+    ),
     "00000000"
   );
   const revenueCenter = normalizeIdSegment(

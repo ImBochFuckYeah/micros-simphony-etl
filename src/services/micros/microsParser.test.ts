@@ -117,6 +117,48 @@ test("parseMicrosSales supports type-bucketed RA exports", () => {
   assert.equal(parsed.details[1].itemCode, "302801");
 });
 
+test("parseMicrosSales falls back to Open Business Date when Close Business Date is blank", () => {
+  const sample: MicrosJsonExport = [
+    [
+      {
+        "Record Type": "GLID",
+        "Store Number": "Lab9999"
+      }
+    ],
+    [
+      {
+        "Record Type": "CHDR",
+        "Revenue Center Number": 101,
+        "Order Type Number": 3,
+        "Check Number": 101,
+        "Open Business Date": "20260803000000",
+        "Close Business Date": " ",
+        "Check Total": 2734.821429
+      }
+    ],
+    [
+      {
+        "Record Type": "CMI",
+        "Revenue Center Number": 101,
+        "Order Type Number": 3,
+        "Guest Check number": 101,
+        "Menu Item Number": 102503,
+        "Line Number": 13,
+        "Line Count": 1,
+        "Line Total": 8.928571
+      }
+    ]
+  ];
+
+  const parsed = parseMicrosSales(sample);
+
+  assert.equal(parsed.headers.length, 1);
+  assert.equal(parsed.headers[0].externalId, "MICROS-CHDR-20260803-101-3-101");
+  assert.equal(parsed.headers[0].businessDate, "2026-08-03");
+  assert.equal(parsed.headers[0].totalAmount, 2734.821429);
+  assert.equal(parsed.details.length, 1);
+});
+
 test("parseMicrosSales resolves finished product description from MNPR catalog", () => {
   const sample: MicrosJsonExport = [
     [

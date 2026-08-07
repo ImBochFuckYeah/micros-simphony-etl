@@ -29,7 +29,9 @@ export const appConfig = {
     remoteDir: required("SFTP_REMOTE_DIR"),
     localDir: process.env.SFTP_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "micros"),
     pedidosRemoteDir: process.env.SFTP_PEDIDOS_REMOTE_DIR,
-    pedidosLocalDir: process.env.SFTP_PEDIDOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "pedidos")
+    pedidosLocalDir: process.env.SFTP_PEDIDOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "pedidos"),
+    consumosRemoteDir: process.env.SFTP_CONSUMOS_REMOTE_DIR,
+    consumosLocalDir: process.env.SFTP_CONSUMOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "consumos")
   } satisfies SftpConfig,
   pedidosApi: {
     uploadUrl: required("PEDIDOS_API_UPLOAD_URL"),
@@ -51,6 +53,7 @@ export const appConfig = {
     companyDB: required("SAP_COMPANY_DB"),
     username: required("SAP_USERNAME"),
     password: required("SAP_PASSWORD"),
+    externalIdField: process.env.SAP_EXTERNAL_ID_FIELD?.trim() || undefined,
     allowSelfSignedCert: process.env.SAP_ALLOW_SELF_SIGNED_CERT === "true",
     debugRequests: process.env.ETL_DEBUG_SAP === "true"
   } satisfies SapServiceLayerConfig,

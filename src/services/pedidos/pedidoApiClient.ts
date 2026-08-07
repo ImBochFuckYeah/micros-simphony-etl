@@ -9,7 +9,10 @@ export interface PedidoApiConfig {
 
 export interface PedidoUploadDetalle {
   success: boolean;
+  id_pedido?: string;
   numero_pedido?: string;
+  estado?: string;
+  total_lineas?: number;
   error?: string;
 }
 

@@ -12,6 +12,8 @@ export interface SftpConfig {
   localDir: string;
   pedidosRemoteDir?: string;
   pedidosLocalDir?: string;
+  consumosRemoteDir?: string;
+  consumosLocalDir?: string;
 }
 
 export interface DownloadedMicrosExport {
@@ -75,6 +77,29 @@ const parseMicrosFileDate = (fileName: string): Date | null => {
   return parsedDate;
 };
 
+const parseConsumoFileDate = (fileName: string): Date | null => {
+  const match = /^CONSUMO_[^_]+_(\d{2})(\d{2})(\d{2})_N\.json$/i.exec(fileName);
+  if (!match) {
+    return null;
+  }
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  const year = 2000 + Number(match[3]);
+  const parsedDate = new Date(year, month - 1, day);
+
+  if (
+    Number.isNaN(parsedDate.getTime()) ||
+    parsedDate.getFullYear() !== year ||
+    parsedDate.getMonth() !== month - 1 ||
+    parsedDate.getDate() !== day
+  ) {
+    return null;
+  }
+
+  return parsedDate;
+};
+
 const normalizeDateOnly = (date: Date): Date =>
   new Date(date.getFullYear(), date.getMonth(), date.getDate());
 
@@ -101,6 +126,14 @@ export class MicrosSftpService {
 
   private get pedidosLocalDir(): string {
     return this.config.pedidosLocalDir ?? path.join(this.config.localDir, "PEDIDOS");
+  }
+
+  private get consumosRemoteDir(): string {
+    return this.config.consumosRemoteDir ?? path.posix.join(this.config.remoteDir, "CONSUMOS");
+  }
+
+  private get consumosLocalDir(): string {
+    return this.config.consumosLocalDir ?? path.join(this.config.localDir, "CONSUMOS");
   }
 
   private async connect(): Promise<void> {
@@ -266,6 +299,82 @@ export class MicrosSftpService {
   async movePedidoFileToOk(fileName: string): Promise<void> {
     const sourcePath = path.posix.join(this.pedidosRemoteDir, fileName);
     const okDir = path.posix.join(this.pedidosRemoteDir, "OK");
+    const targetPath = path.posix.join(okDir, fileName);
+
+    await this.connect();
+
+    try {
+      const okDirExists = await this.client.exists(okDir);
+      if (!okDirExists) {
+        await this.client.mkdir(okDir, true);
+      }
+
+      await this.client.rename(sourcePath, targetPath);
+    } finally {
+      await this.client.end();
+    }
+  }
+
+  async downloadConsumoFiles(range: MicrosExportDateRange): Promise<DownloadedMicrosExport[]> {
+    await fs.mkdir(this.consumosLocalDir, { recursive: true });
+    await this.connect();
+
+    try {
+      const remoteFiles = await this.client.list(this.consumosRemoteDir);
+      const files = remoteFiles.filter((file) => {
+        if (file.type !== "-") {
+          return false;
+        }
+
+        const fileDate = parseConsumoFileDate(file.name);
+        return fileDate ? isDateWithinRange(fileDate, range) : false;
+      });
+
+      logger.info("SFTP CONSUMOS files matched", {
+        remoteDir: this.consumosRemoteDir,
+        startDate: range.startDate,
+        endDate: range.endDate,
+        count: files.length,
+        sampleFiles: files.slice(0, 25).map((file) => file.name)
+      });
+
+      const downloaded: DownloadedMicrosExport[] = [];
+
+      for (const [index, file] of files.entries()) {
+        const localPath = path.join(this.consumosLocalDir, file.name);
+        const remotePath = path.posix.join(this.consumosRemoteDir, file.name);
+
+        logger.info("SFTP CONSUMOS download started", {
+          index: index + 1,
+          total: files.length,
+          fileName: file.name
+        });
+
+        await this.client.fastGet(remotePath, localPath);
+
+        logger.info("SFTP CONSUMOS download finished", {
+          index: index + 1,
+          total: files.length,
+          fileName: file.name,
+          localPath
+        });
+
+        downloaded.push({
+          localPath,
+          remotePath,
+          fileName: file.name
+        });
+      }
+
+      return downloaded;
+    } finally {
+      await this.client.end();
+    }
+  }
+
+  async moveConsumoFileToOk(fileName: string): Promise<void> {
+    const sourcePath = path.posix.join(this.consumosRemoteDir, fileName);
+    const okDir = path.posix.join(this.consumosRemoteDir, "OK");
     const targetPath = path.posix.join(okDir, fileName);
 
     await this.connect();

@@ -9,7 +9,7 @@ interface SapSessionResponse {
 export interface SapSalePayload {
   CardCode: string;
   Series?: number;
-  U_MICROS_ExternalId: string;
+  U_MICROS_ExternalId?: string;
   DocDate: string;
   DocDueDate?: string;
   ReserveInvoice?: "tYES" | "tNO";
@@ -19,6 +19,18 @@ export interface SapSalePayload {
     Quantity: number;
     PriceAfterVAT: number;
     WarehouseCode: string;
+  }>;
+}
+
+export interface SapInventoryExitPayload {
+  U_MICROS_ExternalId?: string;
+  DocDate: string;
+  Comments?: string;
+  DocumentLines: Array<{
+    ItemCode: string;
+    Quantity: number;
+    WarehouseCode: string;
+    CostingCode?: string;
   }>;
 }
 
@@ -35,11 +47,19 @@ interface SapItemsResponse {
   "@odata.nextLink"?: string;
 }
 
+interface SapDocumentLookupResponse {
+  value: Array<{
+    DocEntry: number;
+    DocNum: number;
+  }>;
+}
+
 export interface SapServiceLayerConfig {
   baseUrl: string;
   companyDB: string;
   username: string;
   password: string;
+  externalIdField?: string;
   allowSelfSignedCert?: boolean;
   debugRequests?: boolean;
 }
@@ -102,6 +122,7 @@ export class SapServiceLayerClient {
 
   async postSale(payload: SapSalePayload): Promise<SapPostedDocument> {
     await this.ensureAuthenticated();
+    const requestPayload = this.withConfiguredExternalIdField(payload);
 
     this.debug("SAP invoice request", {
       url: "/Invoices",
@@ -111,7 +132,7 @@ export class SapServiceLayerClient {
     });
 
     try {
-      const response = await this.http.post("/Invoices", payload, {
+      const response = await this.http.post("/Invoices", requestPayload, {
         headers: { Cookie: this.sessionCookie }
       });
 
@@ -127,7 +148,7 @@ export class SapServiceLayerClient {
           externalId: payload.U_MICROS_ExternalId
         });
         await this.login();
-        const retryResponse = await this.http.post("/Invoices", payload, {
+        const retryResponse = await this.http.post("/Invoices", requestPayload, {
           headers: { Cookie: this.sessionCookie }
         });
 
@@ -150,6 +171,103 @@ export class SapServiceLayerClient {
 
       throw error;
     }
+  }
+
+  async findSaleByExternalId(externalId: string): Promise<SapPostedDocument | null> {
+    await this.ensureAuthenticated();
+
+    const externalIdField = this.config.externalIdField?.trim();
+    if (!externalIdField) {
+      this.debug("SAP invoice lookup skipped because no external ID field is configured", {
+        externalId
+      });
+      return null;
+    }
+
+    const escapedExternalId = externalId.replace(/'/g, "''");
+    const response = await this.http.get<SapDocumentLookupResponse>(
+      `/Invoices?$select=DocEntry,DocNum&$filter=${externalIdField} eq '${escapedExternalId}'&$top=1`,
+      { headers: { Cookie: this.sessionCookie } }
+    );
+    const document = response.data.value[0];
+
+    return document ? this.extractPostedDocument(document) : null;
+  }
+
+  async postInventoryExit(payload: SapInventoryExitPayload): Promise<SapPostedDocument> {
+    await this.ensureAuthenticated();
+    const requestPayload = this.withConfiguredExternalIdField(payload);
+
+    this.debug("SAP inventory exit request", {
+      url: "/InventoryGenExits",
+      externalId: payload.U_MICROS_ExternalId,
+      docDate: payload.DocDate,
+      lineCount: payload.DocumentLines.length,
+      payload: requestPayload
+    });
+
+    try {
+      const response = await this.http.post("/InventoryGenExits", requestPayload, {
+        headers: { Cookie: this.sessionCookie }
+      });
+
+      this.debug("SAP inventory exit response", {
+        status: response.status,
+        externalId: payload.U_MICROS_ExternalId
+      });
+
+      return this.extractPostedDocument(response.data);
+    } catch (error) {
+      if (this.isUnauthorized(error)) {
+        this.debug("SAP inventory exit unauthorized, retrying login", {
+          externalId: payload.U_MICROS_ExternalId
+        });
+        await this.login();
+        const retryResponse = await this.http.post("/InventoryGenExits", requestPayload, {
+          headers: { Cookie: this.sessionCookie }
+        });
+
+        this.debug("SAP inventory exit retry response", {
+          status: retryResponse.status,
+          externalId: payload.U_MICROS_ExternalId
+        });
+        return this.extractPostedDocument(retryResponse.data);
+      }
+
+      if (error instanceof AxiosError) {
+        this.debug("SAP inventory exit error", {
+          externalId: payload.U_MICROS_ExternalId,
+          payload: requestPayload,
+          ...toSapErrorContext(error)
+        });
+        throw new Error(
+          `SAP rejected inventory exit (${error.response?.status ?? "NO_STATUS"}): ${JSON.stringify(error.response?.data)}`
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  async findInventoryExitByExternalId(externalId: string): Promise<SapPostedDocument | null> {
+    await this.ensureAuthenticated();
+
+    const externalIdField = this.config.externalIdField?.trim();
+    if (!externalIdField) {
+      this.debug("SAP inventory exit lookup skipped because no external ID field is configured", {
+        externalId
+      });
+      return null;
+    }
+
+    const escapedExternalId = externalId.replace(/'/g, "''");
+    const response = await this.http.get<SapDocumentLookupResponse>(
+      `/InventoryGenExits?$select=DocEntry,DocNum&$filter=${externalIdField} eq '${escapedExternalId}'&$top=1`,
+      { headers: { Cookie: this.sessionCookie } }
+    );
+    const document = response.data.value[0];
+
+    return document ? this.extractPostedDocument(document) : null;
   }
 
   async getSalesItemsBySimphonyId(): Promise<Map<string, string>> {
@@ -220,6 +338,20 @@ export class SapServiceLayerClient {
 
   private isUnauthorized(error: unknown): error is AxiosError {
     return error instanceof AxiosError && error.response?.status === 401;
+  }
+
+  private withConfiguredExternalIdField<T extends { U_MICROS_ExternalId?: string }>(payload: T): Omit<T, "U_MICROS_ExternalId"> & Record<string, unknown> {
+    const { U_MICROS_ExternalId, ...basePayload } = payload;
+    const externalIdField = this.config.externalIdField?.trim();
+
+    if (!externalIdField || !U_MICROS_ExternalId) {
+      return basePayload;
+    }
+
+    return {
+      ...basePayload,
+      [externalIdField]: U_MICROS_ExternalId
+    };
   }
 
   private extractPostedDocument(data: unknown): SapPostedDocument {
