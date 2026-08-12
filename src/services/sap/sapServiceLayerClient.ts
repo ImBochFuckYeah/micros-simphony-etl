@@ -34,6 +34,19 @@ export interface SapInventoryExitPayload {
   }>;
 }
 
+export interface SapInventoryEntryPayload {
+  U_MICROS_ExternalId?: string;
+  DocDate: string;
+  Comments?: string;
+  DocumentLines: Array<{
+    ItemCode: string;
+    Quantity: number;
+    WarehouseCode: string;
+    Price?: number;
+    AccountCode?: string;
+  }>;
+}
+
 export interface SapPostedDocument {
   DocEntry: number;
   DocNum: number;
@@ -263,6 +276,82 @@ export class SapServiceLayerClient {
     const escapedExternalId = externalId.replace(/'/g, "''");
     const response = await this.http.get<SapDocumentLookupResponse>(
       `/InventoryGenExits?$select=DocEntry,DocNum&$filter=${externalIdField} eq '${escapedExternalId}'&$top=1`,
+      { headers: { Cookie: this.sessionCookie } }
+    );
+    const document = response.data.value[0];
+
+    return document ? this.extractPostedDocument(document) : null;
+  }
+
+  async postInventoryEntry(payload: SapInventoryEntryPayload): Promise<SapPostedDocument> {
+    await this.ensureAuthenticated();
+    const requestPayload = this.withConfiguredExternalIdField(payload);
+
+    this.debug("SAP inventory entry request", {
+      url: "/InventoryGenEntries",
+      externalId: payload.U_MICROS_ExternalId,
+      docDate: payload.DocDate,
+      lineCount: payload.DocumentLines.length,
+      payload: requestPayload
+    });
+
+    try {
+      const response = await this.http.post("/InventoryGenEntries", requestPayload, {
+        headers: { Cookie: this.sessionCookie }
+      });
+
+      this.debug("SAP inventory entry response", {
+        status: response.status,
+        externalId: payload.U_MICROS_ExternalId
+      });
+
+      return this.extractPostedDocument(response.data);
+    } catch (error) {
+      if (this.isUnauthorized(error)) {
+        this.debug("SAP inventory entry unauthorized, retrying login", {
+          externalId: payload.U_MICROS_ExternalId
+        });
+        await this.login();
+        const retryResponse = await this.http.post("/InventoryGenEntries", requestPayload, {
+          headers: { Cookie: this.sessionCookie }
+        });
+
+        this.debug("SAP inventory entry retry response", {
+          status: retryResponse.status,
+          externalId: payload.U_MICROS_ExternalId
+        });
+        return this.extractPostedDocument(retryResponse.data);
+      }
+
+      if (error instanceof AxiosError) {
+        this.debug("SAP inventory entry error", {
+          externalId: payload.U_MICROS_ExternalId,
+          payload: requestPayload,
+          ...toSapErrorContext(error)
+        });
+        throw new Error(
+          `SAP rejected inventory entry (${error.response?.status ?? "NO_STATUS"}): ${JSON.stringify(error.response?.data)}`
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  async findInventoryEntryByExternalId(externalId: string): Promise<SapPostedDocument | null> {
+    await this.ensureAuthenticated();
+
+    const externalIdField = this.config.externalIdField?.trim();
+    if (!externalIdField) {
+      this.debug("SAP inventory entry lookup skipped because no external ID field is configured", {
+        externalId
+      });
+      return null;
+    }
+
+    const escapedExternalId = externalId.replace(/'/g, "''");
+    const response = await this.http.get<SapDocumentLookupResponse>(
+      `/InventoryGenEntries?$select=DocEntry,DocNum&$filter=${externalIdField} eq '${escapedExternalId}'&$top=1`,
       { headers: { Cookie: this.sessionCookie } }
     );
     const document = response.data.value[0];

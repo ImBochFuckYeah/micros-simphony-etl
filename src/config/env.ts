@@ -31,7 +31,9 @@ export const appConfig = {
     pedidosRemoteDir: process.env.SFTP_PEDIDOS_REMOTE_DIR,
     pedidosLocalDir: process.env.SFTP_PEDIDOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "pedidos"),
     consumosRemoteDir: process.env.SFTP_CONSUMOS_REMOTE_DIR,
-    consumosLocalDir: process.env.SFTP_CONSUMOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "consumos")
+    consumosLocalDir: process.env.SFTP_CONSUMOS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "consumos"),
+    entradasRemoteDir: process.env.SFTP_ENTRADAS_REMOTE_DIR,
+    entradasLocalDir: process.env.SFTP_ENTRADAS_LOCAL_DIR ?? path.resolve(process.cwd(), "data", "entradas")
   } satisfies SftpConfig,
   pedidosApi: {
     uploadUrl: required("PEDIDOS_API_UPLOAD_URL"),

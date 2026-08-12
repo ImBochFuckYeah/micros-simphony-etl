@@ -5,6 +5,7 @@ import { appConfig } from "../config/env.js";
 import { SqlServerClient } from "../services/db/sqlServerClient.js";
 import { logger, startLoggerInactivityWatchdog, stopLoggerInactivityWatchdog } from "../services/logger.js";
 import { parseMicrosInventoryConsumptions } from "../services/micros/consumoParser.js";
+import { parseMicrosInventoryEntries } from "../services/micros/entradaParser.js";
 import { parseMicrosSales } from "../services/micros/microsParser.js";
 import {
   PedidoApiClient,
@@ -13,6 +14,7 @@ import {
 } from "../services/pedidos/pedidoApiClient.js";
 import {
   SapServiceLayerClient,
+  type SapInventoryEntryPayload,
   type SapInventoryExitPayload,
   type SapSalePayload
 } from "../services/sap/sapServiceLayerClient.js";
@@ -37,6 +39,7 @@ interface PedidoUploadOutcome {
 const MAX_SAP_DELIVERY_ATTEMPTS = 3;
 const MAX_PEDIDO_DELIVERY_ATTEMPTS = 3;
 const MAX_CONSUMO_DELIVERY_ATTEMPTS = 3;
+const MAX_ENTRADA_DELIVERY_ATTEMPTS = 3;
 
 const hashPayload = (payload: unknown): string =>
   createHash("sha256").update(JSON.stringify(payload)).digest("hex");
@@ -106,6 +109,9 @@ const extractBusinessDateFromFileName = (fileName: string): string | null => {
 const buildConsumoExternalId = (fileName: string, storeNumber: string, firstBusinessDate: string): string =>
   `CONSUMO-${storeNumber}-${firstBusinessDate.replace(/-/g, "")}-${fileName.replace(/\.[^.]+$/i, "")}`;
 
+const buildEntradaExternalId = (fileName: string, storeNumber: string, firstBusinessDate: string): string =>
+  `ENTRADA-${storeNumber}-${firstBusinessDate.replace(/-/g, "")}-${fileName.replace(/\.[^.]+$/i, "")}`;
+
 const mapConsumoToSapInventoryExitPayload = (
   input: {
     externalId: string;
@@ -125,6 +131,26 @@ const mapConsumoToSapInventoryExitPayload = (
     Quantity: line.quantity,
     WarehouseCode: input.warehouseCode,
     CostingCode: input.costingCode
+  }))
+});
+
+const mapEntradaToSapInventoryEntryPayload = (
+  input: {
+    externalId: string;
+    businessDate: string;
+    fileName: string;
+    storeNumber: string;
+    warehouseCode: string;
+    lines: Array<{ itemCode: string; quantity: number }>;
+  }
+): SapInventoryEntryPayload => ({
+  U_MICROS_ExternalId: input.externalId,
+  DocDate: input.businessDate,
+  Comments: `MICROS entrada ${input.businessDate} ${input.storeNumber} (${input.fileName})`,
+  DocumentLines: input.lines.map((line) => ({
+    ItemCode: line.itemCode,
+    Quantity: line.quantity,
+    WarehouseCode: input.warehouseCode
   }))
 });
 
@@ -691,8 +717,11 @@ const processConsumoFiles = async (
   sapClient: SapServiceLayerClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
-  range: ProcessingDateRange
-): Promise<void> => {
+  range: ProcessingDateRange,
+  options?: { moveToOk?: boolean }
+): Promise<string[]> => {
+  const shouldMoveToOk = options?.moveToOk ?? true;
+  const processedFiles: string[] = [];
   const downloadedFiles = await sftpService.downloadConsumoFiles({ startDate: range.startDate, endDate: range.endDate });
   logger.info("SFTP CONSUMOS files downloaded", { count: downloadedFiles.length });
 
@@ -985,8 +1014,11 @@ const processConsumoFiles = async (
       }
 
       if (sapSuccess) {
-        await sftpService.moveConsumoFileToOk(downloadedFile.fileName);
-        movedToOk = true;
+        if (shouldMoveToOk) {
+          await sftpService.moveConsumoFileToOk(downloadedFile.fileName);
+          movedToOk = true;
+        }
+        processedFiles.push(downloadedFile.fileName);
       }
 
       await middlewareClient.closeConsumoFileEvent(fileEventId, {
@@ -1069,6 +1101,431 @@ const processConsumoFiles = async (
         });
       }
     }
+  }
+
+  return processedFiles;
+};
+
+const processEntradaFiles = async (
+  sftpService: MicrosSftpService,
+  sqlServerClient: SqlServerClient,
+  sapClient: SapServiceLayerClient,
+  middlewareClient: MiddlewareDbClient,
+  runId: number,
+  range: ProcessingDateRange,
+  options?: { moveToOk?: boolean }
+): Promise<string[]> => {
+  const shouldMoveToOk = options?.moveToOk ?? true;
+  const processedFiles: string[] = [];
+  const downloadedFiles = await sftpService.downloadEntradaFiles({ startDate: range.startDate, endDate: range.endDate });
+  logger.info("SFTP ENTRADAS files downloaded", { count: downloadedFiles.length });
+
+  for (const downloadedFile of downloadedFiles) {
+    const fileEventId = await middlewareClient.openEntradaFileEvent(
+      runId,
+      downloadedFile.fileName,
+      downloadedFile.remotePath
+    );
+
+    let movedToOk = false;
+    let sapSuccess = false;
+    let totalLines = 0;
+    let uploadedLines = 0;
+    let skippedLines = 0;
+    let sapDocNum: number | undefined;
+    let sapDocEntry: number | undefined;
+    let storeNumber = "";
+    let businessDate = "";
+    let deliveryAttempt: { id: number; attempts: number } | null = null;
+    let localFileDeleted = false;
+
+    try {
+      const content = await fs.readFile(downloadedFile.localPath, "utf-8");
+      const entradaJson = JSON.parse(content) as ConsumoJsonExport;
+      const parsedEntrada = parseMicrosInventoryEntries(entradaJson);
+      storeNumber = parsedEntrada.storeNumber;
+      businessDate = parsedEntrada.firstBusinessDate;
+
+      logger.info("ENTRADAS file parsed", {
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        businessDate,
+        rawLineCount: parsedEntrada.lines.length
+      });
+
+      const storeConfig = await sqlServerClient.getStoreSapInventoryConfigBySimphonyStoreNumber(storeNumber);
+      if (!storeConfig || !storeConfig.enableUploadingDocuments) {
+        const errorMessage = `Store ${storeNumber} is not enabled for SAP inventory upload`;
+        logger.info("ENTRADAS file skipped before SAP upload", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          reason: errorMessage
+        });
+        await middlewareClient.openAlert({
+          severity: "warning",
+          category: "entrada_store_mapping_missing",
+          deduplicationKey: `entrada_store_mapping_missing:${storeNumber}`,
+          message: errorMessage,
+          context: { storeNumber, fileName: downloadedFile.fileName }
+        });
+        await middlewareClient.closeEntradaFileEvent(fileEventId, {
+          status: "failed",
+          sapSuccess,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          movedToOk,
+          storeNumber,
+          businessDate,
+          errorMessage
+        });
+        continue;
+      }
+
+      if (!storeConfig.warehouseCode) {
+        const errorMessage = `Store ${storeNumber} is missing whsCode in tTienda`;
+        logger.info("ENTRADAS file skipped before SAP upload", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          reason: errorMessage
+        });
+        await middlewareClient.openAlert({
+          severity: "error",
+          category: "entrada_store_mapping_missing",
+          deduplicationKey: `entrada_store_mapping_missing:${storeNumber}`,
+          message: errorMessage,
+          context: { storeNumber, fileName: downloadedFile.fileName }
+        });
+        await middlewareClient.closeEntradaFileEvent(fileEventId, {
+          status: "failed",
+          sapSuccess,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          movedToOk,
+          storeNumber,
+          businessDate,
+          errorMessage
+        });
+        continue;
+      }
+
+      const groupedLines = new Map<string, number>();
+      for (const line of parsedEntrada.lines) {
+        const current = groupedLines.get(line.itemCode) ?? 0;
+        groupedLines.set(line.itemCode, current + line.quantity);
+      }
+
+      totalLines = parsedEntrada.lines.length;
+      const uploadableLines = Array.from(groupedLines.entries())
+        .map(([itemCode, quantity]) => ({ itemCode, quantity }))
+        .filter((line) => line.quantity > 0);
+
+      uploadedLines = uploadableLines.length;
+      skippedLines = Math.max(totalLines - uploadedLines, 0);
+
+      logger.info("ENTRADAS line aggregation summary", {
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        businessDate,
+        totalLines,
+        uploadedLines,
+        skippedLines
+      });
+
+      if (uploadableLines.length === 0) {
+        const errorMessage = `ENTRADAS file ${downloadedFile.fileName} has no valid lines to upload`;
+        logger.info("ENTRADAS file skipped before SAP upload", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          reason: errorMessage
+        });
+        await middlewareClient.closeEntradaFileEvent(fileEventId, {
+          status: "failed",
+          sapSuccess,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          movedToOk,
+          storeNumber,
+          businessDate,
+          errorMessage
+        });
+        continue;
+      }
+
+      const externalId = buildEntradaExternalId(downloadedFile.fileName, storeNumber, parsedEntrada.firstBusinessDate);
+      const payload = mapEntradaToSapInventoryEntryPayload({
+        externalId,
+        businessDate: parsedEntrada.firstBusinessDate,
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        warehouseCode: storeConfig.warehouseCode,
+        lines: uploadableLines
+      });
+
+      logger.info("ENTRADAS SAP payload prepared", {
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        businessDate,
+        externalId,
+        docDate: payload.DocDate,
+        lineCount: payload.DocumentLines.length,
+        sampleItemCodes: payload.DocumentLines.map((line) => line.ItemCode).slice(0, 20)
+      });
+
+      const payloadHash = hashPayload(payload);
+      const delivery = await middlewareClient.getOrCreateEntradaDelivery(
+        downloadedFile.fileName,
+        downloadedFile.remotePath,
+        payloadHash
+      );
+      deliveryAttempt = { id: delivery.id, attempts: delivery.attempts };
+
+      if (delivery.payloadHash !== payloadHash) {
+        const errorMessage = `Payload changed for existing ENTRADAS delivery ${downloadedFile.fileName}`;
+        logger.info("ENTRADAS delivery blocked", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          reason: errorMessage
+        });
+        await middlewareClient.failEntradaDelivery(delivery.id, errorMessage, true);
+        await middlewareClient.openAlert({
+          severity: "error",
+          category: "entrada_delivery_payload_changed",
+          deduplicationKey: `entrada_delivery_payload_changed:${downloadedFile.fileName}`,
+          message: errorMessage,
+          context: { fileName: downloadedFile.fileName }
+        });
+        await middlewareClient.closeEntradaFileEvent(fileEventId, {
+          status: "failed",
+          sapSuccess,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          movedToOk,
+          storeNumber,
+          businessDate,
+          responsePayload: payload,
+          errorMessage
+        });
+        continue;
+      }
+
+      if (delivery.status === "manual_intervention_required") {
+        logger.info("ENTRADAS delivery skipped", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          reason: "ENTRADAS delivery requires manual intervention"
+        });
+        await middlewareClient.closeEntradaFileEvent(fileEventId, {
+          status: "failed",
+          sapSuccess,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          movedToOk,
+          storeNumber,
+          businessDate,
+          responsePayload: payload,
+          errorMessage: "ENTRADAS delivery requires manual intervention"
+        });
+        continue;
+      }
+
+      if (delivery.status === "confirmed" && delivery.sapDocNum !== null && delivery.sapDocEntry !== null) {
+        sapSuccess = true;
+        sapDocNum = delivery.sapDocNum;
+        sapDocEntry = delivery.sapDocEntry;
+      } else {
+        if (delivery.attempts >= MAX_ENTRADA_DELIVERY_ATTEMPTS) {
+          const errorMessage = `ENTRADAS delivery exhausted ${MAX_ENTRADA_DELIVERY_ATTEMPTS} attempts`;
+          logger.info("ENTRADAS delivery skipped", {
+            fileName: downloadedFile.fileName,
+            storeNumber,
+            businessDate,
+            attempts: delivery.attempts,
+            reason: errorMessage
+          });
+          await middlewareClient.failEntradaDelivery(delivery.id, errorMessage, true);
+          await middlewareClient.openAlert({
+            severity: "error",
+            category: "entrada_delivery_failed",
+            deduplicationKey: `entrada_delivery_failed:${downloadedFile.fileName}`,
+            message: errorMessage,
+            context: { fileName: downloadedFile.fileName, attempts: delivery.attempts }
+          });
+          await middlewareClient.closeEntradaFileEvent(fileEventId, {
+            status: "failed",
+            sapSuccess,
+            totalLines,
+            uploadedLines,
+            skippedLines,
+            movedToOk,
+            storeNumber,
+            businessDate,
+            responsePayload: payload,
+            errorMessage
+          });
+          continue;
+        }
+
+        await middlewareClient.markEntradaDeliverySending(delivery.id);
+        const existingDocument = await sapClient.findInventoryEntryByExternalId(externalId);
+        const posted = existingDocument ?? await sapClient.postInventoryEntry(payload);
+        await middlewareClient.confirmEntradaDelivery(delivery.id, posted.DocNum, posted.DocEntry);
+
+        sapSuccess = true;
+        sapDocNum = posted.DocNum;
+        sapDocEntry = posted.DocEntry;
+
+        logger.info("ENTRADAS inventory entry synced to SAP", {
+          fileName: downloadedFile.fileName,
+          storeNumber,
+          businessDate,
+          totalLines,
+          uploadedLines,
+          skippedLines,
+          docNum: posted.DocNum,
+          docEntry: posted.DocEntry,
+          recoveredExistingDocument: Boolean(existingDocument)
+        });
+      }
+
+      if (sapSuccess) {
+        if (shouldMoveToOk) {
+          await sftpService.moveEntradaFileToOk(downloadedFile.fileName);
+          movedToOk = true;
+        }
+        processedFiles.push(downloadedFile.fileName);
+      }
+
+      await middlewareClient.closeEntradaFileEvent(fileEventId, {
+        status: sapSuccess ? "uploaded" : "failed",
+        sapSuccess,
+        totalLines,
+        uploadedLines,
+        skippedLines,
+        movedToOk,
+        sapDocNum,
+        sapDocEntry,
+        storeNumber,
+        businessDate,
+        responsePayload: payload
+      });
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      logger.error("ENTRADAS file processing failed", {
+        fileName: downloadedFile.fileName,
+        remotePath: downloadedFile.remotePath,
+        storeNumber,
+        businessDate,
+        totalLines,
+        uploadedLines,
+        skippedLines,
+        error: error instanceof Error ? { message: error.message, stack: error.stack } : error
+      });
+
+      if (deliveryAttempt) {
+        const requiresManualIntervention = deliveryAttempt.attempts + 1 >= MAX_ENTRADA_DELIVERY_ATTEMPTS;
+        await middlewareClient.failEntradaDelivery(
+          deliveryAttempt.id,
+          errorMessage,
+          requiresManualIntervention
+        ).catch(() => {});
+
+        if (requiresManualIntervention) {
+          await middlewareClient.openAlert({
+            severity: "error",
+            category: "entrada_delivery_failed",
+            deduplicationKey: `entrada_delivery_failed:${downloadedFile.fileName}`,
+            message: `ENTRADAS delivery exhausted ${MAX_ENTRADA_DELIVERY_ATTEMPTS} attempts: ${errorMessage}`,
+            context: { fileName: downloadedFile.fileName, attempts: deliveryAttempt.attempts + 1 }
+          }).catch(() => {});
+        }
+      }
+
+      await middlewareClient.closeEntradaFileEvent(fileEventId, {
+        status: "failed",
+        sapSuccess,
+        totalLines,
+        uploadedLines,
+        skippedLines,
+        movedToOk,
+        sapDocNum,
+        sapDocEntry,
+        storeNumber,
+        businessDate,
+        errorMessage
+      }).catch(() => {});
+    } finally {
+      try {
+        await fs.rm(downloadedFile.localPath, { force: true });
+        localFileDeleted = true;
+      } catch (cleanupError) {
+        logger.error("ENTRADAS local file cleanup failed", {
+          fileName: downloadedFile.fileName,
+          localPath: downloadedFile.localPath,
+          error: cleanupError instanceof Error
+            ? { message: cleanupError.message, stack: cleanupError.stack }
+            : cleanupError
+        });
+      }
+
+      if (localFileDeleted) {
+        logger.info("Local ENTRADAS file deleted", {
+          fileName: downloadedFile.fileName,
+          filePath: downloadedFile.localPath
+        });
+      }
+    }
+  }
+
+  return processedFiles;
+};
+
+const processInventoryFlowsInFullIntegration = async (
+  sftpService: MicrosSftpService,
+  sqlServerClient: SqlServerClient,
+  sapClient: SapServiceLayerClient,
+  middlewareClient: MiddlewareDbClient,
+  runId: number,
+  range: ProcessingDateRange
+): Promise<void> => {
+  const entradaFiles = await processEntradaFiles(
+    sftpService,
+    sqlServerClient,
+    sapClient,
+    middlewareClient,
+    runId,
+    range,
+    { moveToOk: false }
+  );
+  const consumoFiles = await processConsumoFiles(
+    sftpService,
+    sqlServerClient,
+    sapClient,
+    middlewareClient,
+    runId,
+    range,
+    { moveToOk: false }
+  );
+
+  for (const fileName of entradaFiles) {
+    await sftpService.moveEntradaFileToOk(fileName);
+  }
+
+  for (const fileName of consumoFiles) {
+    await sftpService.moveConsumoFileToOk(fileName);
   }
 };
 
@@ -1183,6 +1640,7 @@ export const runFullIntegrationOnce = async (
 
   try {
     await ingestMicrosExports(sftpService, sqlServerClient, middlewareClient, runId, range);
+    await processInventoryFlowsInFullIntegration(sftpService, sqlServerClient, sapClient, middlewareClient, runId, range);
     await syncPendingSalesToSap(sqlServerClient, sapClient, middlewareClient, runId, range);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
@@ -1280,6 +1738,50 @@ export const processConsumosFilesOnce = async (
   }
 };
 
+export const processEntradasFilesOnce = async (
+  startDateInput?: string | Date,
+  endDateInput?: string | Date,
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const range = resolveProcessingDateRange(startDateInput, endDateInput);
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const sapClient = new SapServiceLayerClient(appConfig.sap);
+  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+
+  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+    logger.info("ENTRADAS upload skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "entrada_upload",
+    triggerMode,
+    dateRangeStart: range.startDate,
+    dateRangeEnd: range.endDate
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-entrada-sync");
+  await sqlServerClient.connect();
+
+  try {
+    await processEntradaFiles(sftpService, sqlServerClient, sapClient, middlewareClient, runId, range);
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    try {
+      await sapClient.logout();
+    } finally {
+      await sqlServerClient.disconnect();
+      await middlewareClient.disconnect().catch(() => {});
+    }
+  }
+};
+
 const runScheduledJob = async (schedule: Pick<JobSchedule, "jobType" | "name">): Promise<void> => {
   try {
     switch (schedule.jobType) {
@@ -1297,6 +1799,9 @@ const runScheduledJob = async (schedule: Pick<JobSchedule, "jobType" | "name">):
         break;
       case "consumo_upload":
         await processConsumosFilesOnce(undefined, undefined, "cron");
+        break;
+      case "entrada_upload":
+        await processEntradasFilesOnce(undefined, undefined, "cron");
         break;
     }
   } catch (error) {

@@ -65,6 +65,21 @@ export interface ConsumoFileEventResult {
   errorMessage?: string;
 }
 
+export interface EntradaFileEventResult {
+  status: "uploaded" | "failed";
+  sapSuccess: boolean;
+  totalLines: number;
+  uploadedLines: number;
+  skippedLines: number;
+  movedToOk: boolean;
+  sapDocNum?: number;
+  sapDocEntry?: number;
+  storeNumber?: string;
+  businessDate?: string;
+  responsePayload?: unknown;
+  errorMessage?: string;
+}
+
 export interface SapDeliveryInput {
   externalId: string;
   businessDate: string;
@@ -98,10 +113,19 @@ export interface ConsumoDelivery {
   sapDocEntry: number | null;
 }
 
+export interface EntradaDelivery {
+  id: number;
+  status: "pending" | "sending" | "confirmed" | "failed" | "manual_intervention_required";
+  attempts: number;
+  payloadHash: string;
+  sapDocNum: number | null;
+  sapDocEntry: number | null;
+}
+
 export interface JobSchedule {
   id: number;
   name: string;
-  jobType: "sftp_ingest" | "sap_sync" | "full_integration" | "pedido_upload" | "consumo_upload";
+  jobType: "sftp_ingest" | "sap_sync" | "full_integration" | "pedido_upload" | "consumo_upload" | "entrada_upload";
   cronExpression: string;
   timezone: string;
 }
@@ -126,7 +150,7 @@ export class MiddlewareDbClient {
   }
 
   async createRun(params: {
-    jobType: "sftp_ingest" | "sap_sync" | "full_integration" | "pedido_upload" | "consumo_upload";
+    jobType: "sftp_ingest" | "sap_sync" | "full_integration" | "pedido_upload" | "consumo_upload" | "entrada_upload";
     triggerMode: "cron" | "manual";
     dateRangeStart?: string;
     dateRangeEnd?: string;
@@ -453,6 +477,115 @@ export class MiddlewareDbClient {
   async closeConsumoFileEvent(id: number, result: ConsumoFileEventResult): Promise<void> {
     await this.pool.query(
       `UPDATE etl.consumo_file_event
+       SET status           = $1,
+           sap_success      = $2,
+           total_lines      = $3,
+           uploaded_lines   = $4,
+           skipped_lines    = $5,
+           moved_to_ok      = $6,
+           sap_doc_num      = $7,
+           sap_doc_entry    = $8,
+           store_number     = $9,
+           business_date    = $10,
+           response_payload = $11,
+           error_message    = $12
+       WHERE id = $13`,
+      [
+        result.status,
+        result.sapSuccess,
+        result.totalLines,
+        result.uploadedLines,
+        result.skippedLines,
+        result.movedToOk,
+        result.sapDocNum ?? null,
+        result.sapDocEntry ?? null,
+        result.storeNumber ?? null,
+        result.businessDate ?? null,
+        result.responsePayload ? JSON.stringify(result.responsePayload) : null,
+        result.errorMessage ?? null,
+        id
+      ]
+    );
+  }
+
+  async openEntradaFileEvent(
+    runId: number,
+    fileName: string,
+    remotePath: string | null
+  ): Promise<number> {
+    const result = await this.pool.query<{ id: string }>(
+      `INSERT INTO etl.entrada_file_event (run_id, file_name, remote_path)
+       VALUES ($1, $2, $3)
+       RETURNING id`,
+      [runId, fileName, remotePath]
+    );
+    return Number(result.rows[0].id);
+  }
+
+  async getOrCreateEntradaDelivery(
+    fileName: string,
+    remotePath: string | null,
+    payloadHash: string
+  ): Promise<EntradaDelivery> {
+    const result = await this.pool.query<{
+      id: string;
+      status: EntradaDelivery["status"];
+      attempts: number;
+      payload_hash: string;
+      sap_doc_num: number | null;
+      sap_doc_entry: number | null;
+    }>(
+      `INSERT INTO etl.entrada_file_delivery (file_name, remote_path, payload_hash)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (file_name) DO UPDATE SET remote_path = EXCLUDED.remote_path, updated_at = NOW()
+       RETURNING id, status, attempts, payload_hash, sap_doc_num, sap_doc_entry`,
+      [fileName, remotePath, payloadHash]
+    );
+    const row = result.rows[0];
+
+    return {
+      id: Number(row.id),
+      status: row.status,
+      attempts: row.attempts,
+      payloadHash: row.payload_hash,
+      sapDocNum: row.sap_doc_num,
+      sapDocEntry: row.sap_doc_entry
+    };
+  }
+
+  async markEntradaDeliverySending(id: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE etl.entrada_file_delivery
+       SET status = 'sending', attempts = attempts + 1, updated_at = NOW(), last_error = NULL
+       WHERE id = $1`,
+      [id]
+    );
+  }
+
+  async confirmEntradaDelivery(id: number, docNum: number, docEntry: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE etl.entrada_file_delivery
+       SET status = 'confirmed', sap_doc_num = $2, sap_doc_entry = $3,
+           confirmed_at = NOW(), updated_at = NOW(), last_error = NULL
+       WHERE id = $1`,
+      [id, docNum, docEntry]
+    );
+  }
+
+  async failEntradaDelivery(id: number, errorMessage: string, requiresManualIntervention: boolean): Promise<void> {
+    await this.pool.query(
+      `UPDATE etl.entrada_file_delivery
+       SET status = CASE WHEN $3 THEN 'manual_intervention_required' ELSE 'failed' END,
+           last_error = $2, next_attempt_at = CASE WHEN $3 THEN NULL ELSE NOW() + INTERVAL '5 minutes' END,
+           updated_at = NOW()
+       WHERE id = $1`,
+      [id, errorMessage, requiresManualIntervention]
+    );
+  }
+
+  async closeEntradaFileEvent(id: number, result: EntradaFileEventResult): Promise<void> {
+    await this.pool.query(
+      `UPDATE etl.entrada_file_event
        SET status           = $1,
            sap_success      = $2,
            total_lines      = $3,
