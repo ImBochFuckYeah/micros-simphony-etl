@@ -199,3 +199,85 @@ test("parseMicrosSales resolves finished product description from MNPR catalog",
   assert.equal(parsed.details[0].itemCode, "301101");
   assert.equal(parsed.details[0].itemDescription, "Ensalada");
 });
+
+test("parseMicrosSales derives transaction flags from CDTL records", () => {
+  const sample: MicrosJsonExport = [
+    [
+      {
+        "Record Type": "CHDR",
+        "Revenue Center Number": 101,
+        "Order Type Number": 2,
+        "Check Number": 2201,
+        "Close Business Date": "20260712000000",
+        "Check Total": 25
+      },
+      {
+        "Record Type": "CDTL",
+        "Revenue Center Number": 101,
+        "Order Type Number": 2,
+        "Check Number": 2201,
+        "Master Item Pos Ref Num": 301101,
+        "Line Quantity": 1,
+        "Line Total": 25,
+        "Is Void Flag": 1,
+        "Is Return Flag": 0,
+        "Reopen Closed Check Flag": 1
+      }
+    ]
+  ];
+
+  const parsed = parseMicrosSales(sample);
+
+  assert.equal(parsed.headers.length, 1);
+  assert.equal(parsed.headers[0].rawHeader["Is Void Flag"], true);
+  assert.equal(parsed.headers[0].rawHeader["Is Return Flag"], false);
+  assert.equal(parsed.headers[0].rawHeader["Reopen Closed Check Flag"], true);
+});
+
+test("parseMicrosSales derives transaction flags from bucketed CDTL records", () => {
+  const sample: MicrosJsonExport = [
+    [
+      {
+        "Record Type": "CHDR",
+        "Revenue Center Number": 101,
+        "Order Type Number": 2,
+        "Check Number": 3301,
+        "Close Business Date": "20260712000000",
+        "Check Total": 33
+      }
+    ],
+    [
+      {
+        "Record Type": "CMI",
+        "Revenue Center Number": 101,
+        "Order Type Number": 2,
+        "Guest Check number": 3301,
+        "Menu Item Number": 103009,
+        "Line Number": 1,
+        "Line Count": 1,
+        "Line Total": 33
+      }
+    ],
+    [
+      {
+        "Record Type": "CDTL",
+        "Revenue Center Number": 101,
+        "Order Type Number": 2,
+        "Check Number": 3301,
+        "Master Item Pos Ref Num": 103009,
+        "Line Quantity": 1,
+        "Line Total": 33,
+        "Void Flag": 0,
+        "Return Flag": 1,
+        "Reopen Closed Check Flag": 0
+      }
+    ]
+  ];
+
+  const parsed = parseMicrosSales(sample);
+
+  assert.equal(parsed.headers.length, 1);
+  assert.equal(parsed.headers[0].rawHeader["Is Void Flag"], false);
+  assert.equal(parsed.headers[0].rawHeader["Is Return Flag"], true);
+  assert.equal(parsed.headers[0].rawHeader["Reopen Closed Check Flag"], false);
+});

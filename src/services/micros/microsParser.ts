@@ -10,6 +10,10 @@ import type {
 const DETAIL_TYPES = new Set(["CDTL", "MID"]);
 const BUCKET_DETAIL_TYPES = new Set(["CDTL", "CMI"]);
 
+const VOID_FLAG_KEYS = ["Is Void Flag", "Void Flag", "Void", "Voided", "Cancelled", "Canceled"];
+const RETURN_FLAG_KEYS = ["Is Return Flag", "Return Flag", "Return", "Credit Note"];
+const REOPEN_FLAG_KEYS = ["Reopen Closed Check Flag"];
+
 const asString = (value: unknown, fallback = ""): string =>
   typeof value === "string" ? value : fallback;
 
@@ -26,6 +30,16 @@ const asNumber = (value: unknown, fallback = 0): number => {
     return Number.isFinite(parsed) ? parsed : fallback;
   }
   return fallback;
+};
+
+const asBoolean = (value: unknown): boolean => {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return ["1", "true", "yes", "y", "si", "s"].includes(normalized);
+  }
+  return false;
 };
 
 const asDateString = (value: unknown): string => {
@@ -67,6 +81,38 @@ const buildBucketKey = (record: MicrosRecord, checkField: string): string => {
 };
 
 const asLookupKey = (value: unknown): string => asScalarString(value).trim();
+
+const getFlagValueFromRecords = (records: MicrosRecord[], keys: string[]): boolean | null => {
+  let foundAny = false;
+
+  for (const record of records) {
+    for (const key of keys) {
+      if (Object.prototype.hasOwnProperty.call(record, key)) {
+        foundAny = true;
+        if (asBoolean(record[key])) {
+          return true;
+        }
+      }
+    }
+  }
+
+  return foundAny ? false : null;
+};
+
+const enrichHeaderWithTransactionFlags = (header: MicrosRecord, cdtlRecords: MicrosRecord[]): MicrosRecord => {
+  const voidFlag = getFlagValueFromRecords(cdtlRecords, VOID_FLAG_KEYS) ?? getFlagValueFromRecords([header], VOID_FLAG_KEYS) ?? false;
+  const returnFlag =
+    getFlagValueFromRecords(cdtlRecords, RETURN_FLAG_KEYS) ?? getFlagValueFromRecords([header], RETURN_FLAG_KEYS) ?? false;
+  const reopenFlag =
+    getFlagValueFromRecords(cdtlRecords, REOPEN_FLAG_KEYS) ?? getFlagValueFromRecords([header], REOPEN_FLAG_KEYS) ?? false;
+
+  return {
+    ...header,
+    "Is Void Flag": voidFlag,
+    "Is Return Flag": returnFlag,
+    "Reopen Closed Check Flag": reopenFlag
+  };
+};
 
 const normalizeIdSegment = (value: string, fallback: string): string => {
   const normalized = value.trim().replace(/[^A-Za-z0-9]+/g, "_");
@@ -203,6 +249,7 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
     const cmiDetails = cmiByKey.get(key) ?? [];
     const cdtlDetails = cdtlByKey.get(key) ?? [];
     const bucketDetails = cmiDetails.length > 0 ? cmiDetails : cdtlDetails;
+    const enrichedHeader = enrichHeaderWithTransactionFlags(header, cdtlDetails);
     const totalAmount = asNumber(header["Check Total"], asNumber(header["Total Amount"]));
     const businessDate = asDateString(
       pickFirstNonEmptyValue(header, ["Close Business Date", "Open Business Date", "Business Date"])
@@ -217,7 +264,7 @@ const parseBucketedMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSal
       storeNumberSimphony,
       businessDate,
       totalAmount,
-      rawHeader: header
+      rawHeader: enrichedHeader
     });
 
     bucketDetails.forEach((detailRecord, index) => {
@@ -306,6 +353,9 @@ export const parseMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSale
       continue;
     }
 
+    const cdtlDetails = group.filter((record) => record["Record Type"] === "CDTL");
+    const enrichedHeader = enrichHeaderWithTransactionFlags(header, cdtlDetails);
+
     const externalId = buildExternalId(group, header);
 
     headers.push({
@@ -313,7 +363,7 @@ export const parseMicrosSales = (microsJson: MicrosJsonExport): ParsedMicrosSale
       storeNumberSimphony,
       businessDate: asString(header["Business Date"]),
       totalAmount: asNumber(header["Total Amount"]),
-      rawHeader: header
+      rawHeader: enrichedHeader
     });
 
     const detailRecords = group.filter((record) => DETAIL_TYPES.has(record["Record Type"]));

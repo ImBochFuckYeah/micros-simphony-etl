@@ -190,9 +190,9 @@ const mapHeaderToFacturaSemanal = (header: ParsedInvoiceHeader): FacturaSemanalE
       pickFirstString(rawHeader, ["Order Channel Name", "Channel", "Order Channel", "Source"], "MICROS"),
       HEADER_MAX_LENGTHS.canal
     ),
-    anulada: pickFirstBoolean(rawHeader, ["Auto Closed Flag", "Void", "Voided", "Cancelled", "Canceled"]),
-    contingencia: pickFirstBoolean(rawHeader, ["Check Split Flag", "In Contingency"]),
-    notaCredito: pickFirstBoolean(rawHeader, ["Reopen Closed Check Flag", "Credit Note"]),
+    anulada: pickFirstBoolean(rawHeader, ["Is Void Flag", "Void Flag", "Void", "Voided", "Cancelled", "Canceled"]),
+    contingencia: pickFirstBoolean(rawHeader, ["Reopen Closed Check Flag"]),
+    notaCredito: pickFirstBoolean(rawHeader, ["Is Return Flag", "Return Flag", "Return", "Credit Note"]),
     observaciones: null,
     comentario: null,
     sincronizado: false,
@@ -595,6 +595,7 @@ export class SqlServerClient {
        AND t.tienda = f.tienda
       WHERE CONVERT(date, f.fechaHora) BETWEEN @startDate AND @endDate
         AND f.numSAP IS NULL
+        AND ISNULL(f.anulada, 0) = 0
         AND t.EnableUploadingDocuments = 1
       ORDER BY f.idFactura
     `);
