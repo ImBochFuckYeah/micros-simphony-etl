@@ -21,3 +21,42 @@ export interface ParsedConsumoDocument {
   dateCreated: string;
   lines: ParsedConsumoLine[];
 }
+
+export interface ParsedConsumoLineEnriched {
+  codigoProducto: string;
+  descripcionProducto: string;
+  unidadMedida: string;
+  cantidadSalida: number;
+  codigoPrimitivoProducto: string;
+  precioUnitario: number;
+}
+
+export interface ParsedConsumoDocumentEnriched {
+  serieTicket: string;
+  numeroTicket: number;
+  storeNumber: string;
+  storeName: string;
+  firstBusinessDate: string;
+  lastBusinessDate: string;
+  fechaHoraIngreso: string;
+  lines: ParsedConsumoLineEnriched[];
+}
+
+export interface ParsedEntradaLine {
+  skuProducto: string;
+  descripcionProducto: string;
+  unidadMedida: string;
+  cantidad: number;
+  precioUnitario: number;
+}
+
+export interface ParsedEntradaDocument {
+  serieTicket: string;
+  numeroTicket: number;
+  storeNumber: string;
+  storeName: string;
+  firstBusinessDate: string;
+  lastBusinessDate: string;
+  dateCreated: string;
+  lines: ParsedEntradaLine[];
+}

@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
 import { createHash } from "node:crypto";
+import path from "node:path";
 import cron from "node-cron";
 import { appConfig } from "../config/env.js";
-import { SqlServerClient } from "../services/db/sqlServerClient.js";
+import { PostgresClient } from "../services/db/postgresClient.js";
 import { logger, startLoggerInactivityWatchdog, stopLoggerInactivityWatchdog } from "../services/logger.js";
-import { parseMicrosInventoryConsumptions } from "../services/micros/consumoParser.js";
+import { parseMicrosInventoryConsumptions, parseMicrosInventoryConsumptionsEnriched } from "../services/micros/consumoParser.js";
 import { parseMicrosInventoryEntries } from "../services/micros/entradaParser.js";
 import { parseMicrosSales } from "../services/micros/microsParser.js";
 import {
@@ -18,7 +19,13 @@ import {
   type SapInventoryExitPayload,
   type SapSalePayload
 } from "../services/sap/sapServiceLayerClient.js";
-import { MicrosSftpService, type MicrosExportDateRange } from "../services/sftp/sftpClient.js";
+import {
+  MicrosSftpService,
+  parseInventoryMovementFileDate,
+  resolveInventoryFlowPaths,
+  type DownloadedMicrosExport,
+  type MicrosExportDateRange
+} from "../services/sftp/sftpClient.js";
 import { MiddlewareDbClient, type JobSchedule } from "../services/db/middlewareClient.js";
 import type { ConsumoJsonExport } from "../types/consumos.js";
 import type { MicrosJsonExport, ParsedInvoiceHeader, ParsedInvoiceDetail } from "../types/micros.js";
@@ -40,6 +47,8 @@ const MAX_SAP_DELIVERY_ATTEMPTS = 3;
 const MAX_PEDIDO_DELIVERY_ATTEMPTS = 3;
 const MAX_CONSUMO_DELIVERY_ATTEMPTS = 3;
 const MAX_ENTRADA_DELIVERY_ATTEMPTS = 3;
+const DEFAULT_JOB_LOCK_NAME = "micros_simphony_etl";
+const PEDIDOS_JOB_LOCK_NAME = "micros_simphony_etl_pedidos";
 
 const hashPayload = (payload: unknown): string =>
   createHash("sha256").update(JSON.stringify(payload)).digest("hex");
@@ -97,6 +106,91 @@ const resolveProcessingDateRange = (
   return {
     startDate: formatDateOnly(start),
     endDate: formatDateOnly(end)
+  };
+};
+
+const isFileDateWithinRange = (fileDate: Date, range: ProcessingDateRange): boolean => {
+  const parsedStart = parseDateInput(range.startDate);
+  const parsedEnd = parseDateInput(range.endDate);
+  const candidate = new Date(fileDate.getFullYear(), fileDate.getMonth(), fileDate.getDate());
+  return candidate >= parsedStart && candidate <= parsedEnd;
+};
+
+const listLocalDownloadedFiles = async (params: {
+  localDir: string;
+  remoteDir: string;
+  range: ProcessingDateRange;
+  parseFileDate: (fileName: string) => Date | null;
+  flowName: string;
+}): Promise<DownloadedMicrosExport[]> => {
+  await fs.mkdir(params.localDir, { recursive: true });
+  const directoryEntries = await fs.readdir(params.localDir, { withFileTypes: true });
+
+  const files = directoryEntries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .filter((fileName) => {
+      const fileDate = params.parseFileDate(fileName);
+      return fileDate ? isFileDateWithinRange(fileDate, params.range) : false;
+    })
+    .sort((left, right) => left.localeCompare(right))
+    .map((fileName) => ({
+      fileName,
+      localPath: path.join(params.localDir, fileName),
+      remotePath: path.posix.join(params.remoteDir, fileName)
+    }));
+
+  logger.info(`${params.flowName} local files loaded for operation`, {
+    localDir: params.localDir,
+    remoteDir: params.remoteDir,
+    count: files.length
+  });
+
+  return files;
+};
+
+const listLocalDownloadedPedidoFiles = async (params: {
+  localDir: string;
+  remoteDir: string;
+}): Promise<DownloadedMicrosExport[]> => {
+  await fs.mkdir(params.localDir, { recursive: true });
+  const directoryEntries = await fs.readdir(params.localDir, { withFileTypes: true });
+
+  const files = directoryEntries
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name)
+    .filter((fileName) => /\.txt$/i.test(fileName))
+    .sort((left, right) => left.localeCompare(right))
+    .map((fileName) => ({
+      fileName,
+      localPath: path.join(params.localDir, fileName),
+      remotePath: path.posix.join(params.remoteDir, fileName)
+    }));
+
+  logger.info("PEDIDOS local files loaded for operation", {
+    localDir: params.localDir,
+    remoteDir: params.remoteDir,
+    count: files.length
+  });
+
+  return files;
+};
+
+const resolvePedidosFlowPaths = (): { localDir: string; remoteDir: string } => ({
+  localDir: appConfig.sftp.pedidosLocalDir,
+  remoteDir: appConfig.sftp.pedidosRemoteDir ?? path.posix.join(appConfig.sftp.remoteDir, "PEDIDOS")
+});
+
+const resolveConsumosFlowPaths = (): { localDir: string; remoteDir: string } => ({
+  localDir: appConfig.sftp.consumosLocalDir,
+  remoteDir: appConfig.sftp.consumosRemoteDir ?? path.posix.join(appConfig.sftp.remoteDir, "CONSUMOS")
+});
+
+const resolveEntradasFlowPaths = (): { localDir: string; remoteDir: string } => {
+  const resolved = resolveInventoryFlowPaths(appConfig.sftp);
+  return {
+    localDir: resolved.entradasLocalDir,
+    remoteDir: resolved.entradasRemoteDir
   };
 };
 
@@ -215,7 +309,7 @@ const hasPedidoValidationError = (outcome: PedidoUploadOutcome): boolean =>
 
 const ingestMicrosExports = async (
   sftpService: MicrosSftpService,
-  sqlServerClient: SqlServerClient,
+  postgresClient: PostgresClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
   range: MicrosExportDateRange
@@ -251,7 +345,7 @@ const ingestMicrosExports = async (
       });
 
       if (headers.length > 0) {
-        insertStats = await sqlServerClient.insertSales(headers, details);
+        insertStats = await postgresClient.insertSales(headers, details);
         logger.info("SQL upsert summary for file", {
           filePath: downloadedFile.localPath,
           ...insertStats
@@ -297,13 +391,13 @@ const ingestMicrosExports = async (
 };
 
 const syncPendingSalesToSap = async (
-  sqlServerClient: SqlServerClient,
+  postgresClient: PostgresClient,
   sapClient: SapServiceLayerClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
   range: ProcessingDateRange
 ): Promise<void> => {
-  const pendingDocuments = await sqlServerClient.getPendingSapDocumentsByDateRange(range.startDate, range.endDate);
+  const pendingDocuments = await postgresClient.getPendingSapDocumentsByDateRange(range.startDate, range.endDate);
   logger.info("Pending consolidated sales loaded for SAP sync", {
     count: pendingDocuments.length,
     startDate: range.startDate,
@@ -444,7 +538,7 @@ const syncPendingSalesToSap = async (
     }
 
     if (delivery.status === "confirmed" && delivery.sapDocNum !== null && delivery.sapDocEntry !== null) {
-      await sqlServerClient.markSapDocumentNumber(document.sourceHeaderIds, delivery.sapDocNum);
+      await postgresClient.markSapDocumentNumber(document.sourceHeaderIds, delivery.sapDocNum);
       continue;
     }
 
@@ -465,7 +559,7 @@ const syncPendingSalesToSap = async (
       await middlewareClient.markSapDeliverySending(delivery.id);
       const existingDocument = await sapClient.findSaleByExternalId(document.externalId);
       const posted = existingDocument ?? await sapClient.postSale(payload);
-      await sqlServerClient.markSapDocumentNumber(document.sourceHeaderIds, posted.DocNum);
+      await postgresClient.markSapDocumentNumber(document.sourceHeaderIds, posted.DocNum);
       await middlewareClient.confirmSapDelivery(delivery.id, posted.DocNum, posted.DocEntry);
       logger.info("Consolidated sale synced to SAP", {
         businessDate: document.businessDate,
@@ -531,10 +625,14 @@ const processPedidoFiles = async (
   pedidoApiClient: PedidoApiClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
-  range: ProcessingDateRange
+  options?: { downloadedFiles?: DownloadedMicrosExport[] }
 ): Promise<void> => {
-  const downloadedFiles = await sftpService.downloadPedidoFiles({ startDate: range.startDate, endDate: range.endDate });
-  logger.info("SFTP PEDIDOS files downloaded", { count: downloadedFiles.length });
+  const downloadedFiles = options?.downloadedFiles
+    ?? await sftpService.downloadPedidoFiles();
+  logger.info("PEDIDOS files ready for operation", {
+    count: downloadedFiles.length,
+    source: options?.downloadedFiles ? "local" : "sftp"
+  });
 
   for (const downloadedFile of downloadedFiles) {
     const fileEventId = await middlewareClient.openPedidoFileEvent(
@@ -554,26 +652,21 @@ const processPedidoFiles = async (
       downloadedFile.fileName,
       downloadedFile.remotePath
     );
-
-    if (delivery.status === "manual_intervention_required") {
-      await middlewareClient.closePedidoFileEvent(fileEventId, {
-        status: "failed",
-        apiSuccess,
-        totalPedidos,
-        pedidosSuccess,
-        pedidosFailed,
-        movedToOk,
-        errorMessage: "PEDIDOS delivery requires manual intervention"
-      });
-      continue;
-    }
+    const isManualInterventionRequired = delivery.status === "manual_intervention_required";
 
     try {
       if (delivery.status === "confirmed") {
         apiSuccess = true;
         deliveryConfirmed = true;
       } else {
-        if (delivery.attempts >= MAX_PEDIDO_DELIVERY_ATTEMPTS) {
+        if (isManualInterventionRequired) {
+          logger.info("PEDIDOS delivery retrying manual-intervention file", {
+            fileName: downloadedFile.fileName,
+            attempts: delivery.attempts
+          });
+        }
+
+        if (delivery.attempts >= MAX_PEDIDO_DELIVERY_ATTEMPTS && !isManualInterventionRequired) {
           const errorMessage = `PEDIDOS delivery exhausted ${MAX_PEDIDO_DELIVERY_ATTEMPTS} attempts`;
           await middlewareClient.failPedidoDelivery(delivery.id, errorMessage, true);
           await middlewareClient.openAlert({
@@ -713,17 +806,21 @@ const processPedidoFiles = async (
 
 const processConsumoFiles = async (
   sftpService: MicrosSftpService,
-  sqlServerClient: SqlServerClient,
+  postgresClient: PostgresClient,
   sapClient: SapServiceLayerClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
   range: ProcessingDateRange,
-  options?: { moveToOk?: boolean }
+  options?: { moveToOk?: boolean; downloadedFiles?: DownloadedMicrosExport[] }
 ): Promise<string[]> => {
   const shouldMoveToOk = options?.moveToOk ?? true;
   const processedFiles: string[] = [];
-  const downloadedFiles = await sftpService.downloadConsumoFiles({ startDate: range.startDate, endDate: range.endDate });
-  logger.info("SFTP CONSUMOS files downloaded", { count: downloadedFiles.length });
+  const downloadedFiles = options?.downloadedFiles
+    ?? await sftpService.downloadConsumoFiles({ startDate: range.startDate, endDate: range.endDate });
+  logger.info("CONSUMOS files ready for operation", {
+    count: downloadedFiles.length,
+    source: options?.downloadedFiles ? "local" : "sftp"
+  });
 
   for (const downloadedFile of downloadedFiles) {
     const fileEventId = await middlewareClient.openConsumoFileEvent(
@@ -748,6 +845,7 @@ const processConsumoFiles = async (
       const content = await fs.readFile(downloadedFile.localPath, "utf-8");
       const consumoJson = JSON.parse(content) as ConsumoJsonExport;
       const parsedConsumo = parseMicrosInventoryConsumptions(consumoJson);
+      const parsedConsumoEnriched = parseMicrosInventoryConsumptionsEnriched(consumoJson);
       storeNumber = parsedConsumo.storeNumber;
       businessDate = parsedConsumo.firstBusinessDate;
 
@@ -758,7 +856,7 @@ const processConsumoFiles = async (
         rawLineCount: parsedConsumo.lines.length
       });
 
-      const storeConfig = await sqlServerClient.getStoreSapInventoryConfigBySimphonyStoreNumber(storeNumber);
+      const storeConfig = await postgresClient.getStoreSapInventoryConfigBySimphonyStoreNumber(storeNumber);
       if (!storeConfig || !storeConfig.enableUploadingDocuments) {
         const errorMessage = `Store ${storeNumber} is not enabled for SAP inventory upload`;
         logger.info("CONSUMOS file skipped before SAP upload", {
@@ -789,7 +887,7 @@ const processConsumoFiles = async (
       }
 
       if (!storeConfig.warehouseCode || !storeConfig.costingCode) {
-        const errorMessage = `Store ${storeNumber} is missing whsCode/costingCode in tTienda`;
+        const errorMessage = `Store ${storeNumber} is missing codigo_almacen_sap/codigo_centro_costo_sap in tienda`;
         logger.info("CONSUMOS file skipped before SAP upload", {
           fileName: downloadedFile.fileName,
           storeNumber,
@@ -864,6 +962,26 @@ const processConsumoFiles = async (
         });
         continue;
       }
+
+      // Persist enriched parsed lines to pos.salida_inventario before SAP operation
+      const enrichedUploadableLines = parsedConsumoEnriched.lines.filter((line) => line.cantidadSalida > 0);
+      const insertedRows = await postgresClient.upsertSalidaInventario(
+        parsedConsumoEnriched.serieTicket,
+        parsedConsumoEnriched.numeroTicket,
+        storeConfig.empresa,
+        storeConfig.tienda,
+        parsedConsumo.storeName,
+        parsedConsumo.firstBusinessDate,
+        parsedConsumoEnriched.fechaHoraIngreso,
+        enrichedUploadableLines
+      );
+
+      logger.info("CONSUMOS rows saved to pos.salida_inventario", {
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        businessDate,
+        insertedRows
+      });
 
       const externalId = buildConsumoExternalId(downloadedFile.fileName, storeNumber, parsedConsumo.firstBusinessDate);
       const payload = mapConsumoToSapInventoryExitPayload({
@@ -1000,6 +1118,13 @@ const processConsumoFiles = async (
         sapDocNum = posted.DocNum;
         sapDocEntry = posted.DocEntry;
 
+        // Update the persisted rows with the SAP document number
+        await postgresClient.updateSalidaInventarioDocNum(
+          parsedConsumoEnriched.serieTicket,
+          parsedConsumoEnriched.numeroTicket,
+          posted.DocNum
+        );
+
         logger.info("CONSUMOS inventory exit synced to SAP", {
           fileName: downloadedFile.fileName,
           storeNumber,
@@ -1108,17 +1233,20 @@ const processConsumoFiles = async (
 
 const processEntradaFiles = async (
   sftpService: MicrosSftpService,
-  sqlServerClient: SqlServerClient,
+  postgresClient: PostgresClient,
   sapClient: SapServiceLayerClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
   range: ProcessingDateRange,
-  options?: { moveToOk?: boolean }
+  options?: { downloadedFiles?: DownloadedMicrosExport[] }
 ): Promise<string[]> => {
-  const shouldMoveToOk = options?.moveToOk ?? true;
   const processedFiles: string[] = [];
-  const downloadedFiles = await sftpService.downloadEntradaFiles({ startDate: range.startDate, endDate: range.endDate });
-  logger.info("SFTP ENTRADAS files downloaded", { count: downloadedFiles.length });
+  const downloadedFiles = options?.downloadedFiles
+    ?? await sftpService.downloadEntradaFiles({ startDate: range.startDate, endDate: range.endDate });
+  logger.info("ENTRADAS files ready for operation", {
+    count: downloadedFiles.length,
+    source: options?.downloadedFiles ? "local" : "sftp"
+  });
 
   for (const downloadedFile of downloadedFiles) {
     const fileEventId = await middlewareClient.openEntradaFileEvent(
@@ -1153,7 +1281,7 @@ const processEntradaFiles = async (
         rawLineCount: parsedEntrada.lines.length
       });
 
-      const storeConfig = await sqlServerClient.getStoreSapInventoryConfigBySimphonyStoreNumber(storeNumber);
+      const storeConfig = await postgresClient.getStoreSapInventoryConfigBySimphonyStoreNumber(storeNumber);
       if (!storeConfig || !storeConfig.enableUploadingDocuments) {
         const errorMessage = `Store ${storeNumber} is not enabled for SAP inventory upload`;
         logger.info("ENTRADAS file skipped before SAP upload", {
@@ -1184,7 +1312,7 @@ const processEntradaFiles = async (
       }
 
       if (!storeConfig.warehouseCode) {
-        const errorMessage = `Store ${storeNumber} is missing whsCode in tTienda`;
+        const errorMessage = `Store ${storeNumber} is missing codigo_almacen_sap in tienda`;
         logger.info("ENTRADAS file skipped before SAP upload", {
           fileName: downloadedFile.fileName,
           storeNumber,
@@ -1212,16 +1340,19 @@ const processEntradaFiles = async (
         continue;
       }
 
-      const groupedLines = new Map<string, number>();
+      const groupedLines = new Map<string, { skuProducto: string; descripcionProducto: string; unidadMedida: string; cantidad: number; precioUnitario: number }>();
       for (const line of parsedEntrada.lines) {
-        const current = groupedLines.get(line.itemCode) ?? 0;
-        groupedLines.set(line.itemCode, current + line.quantity);
+        const existing = groupedLines.get(line.skuProducto);
+        if (existing) {
+          existing.cantidad += line.cantidad;
+          existing.precioUnitario += line.precioUnitario;
+        } else {
+          groupedLines.set(line.skuProducto, { ...line });
+        }
       }
 
       totalLines = parsedEntrada.lines.length;
-      const uploadableLines = Array.from(groupedLines.entries())
-        .map(([itemCode, quantity]) => ({ itemCode, quantity }))
-        .filter((line) => line.quantity > 0);
+      const uploadableLines = Array.from(groupedLines.values()).filter((line) => line.cantidad > 0);
 
       uploadedLines = uploadableLines.length;
       skippedLines = Math.max(totalLines - uploadedLines, 0);
@@ -1260,6 +1391,23 @@ const processEntradaFiles = async (
         continue;
       }
 
+      // Persist parsed lines to pos.entrada_mercancia before SAP operation
+      const insertedRows = await postgresClient.upsertEntradaMercancia(
+        parsedEntrada.serieTicket,
+        parsedEntrada.numeroTicket,
+        storeConfig.empresa,
+        storeConfig.tienda,
+        parsedEntrada.firstBusinessDate,
+        uploadableLines
+      );
+
+      logger.info("ENTRADAS rows saved to pos.entrada_mercancia", {
+        fileName: downloadedFile.fileName,
+        storeNumber,
+        businessDate,
+        insertedRows
+      });
+
       const externalId = buildEntradaExternalId(downloadedFile.fileName, storeNumber, parsedEntrada.firstBusinessDate);
       const payload = mapEntradaToSapInventoryEntryPayload({
         externalId,
@@ -1267,7 +1415,7 @@ const processEntradaFiles = async (
         fileName: downloadedFile.fileName,
         storeNumber,
         warehouseCode: storeConfig.warehouseCode,
-        lines: uploadableLines
+        lines: uploadableLines.map((line) => ({ itemCode: line.skuProducto, quantity: line.cantidad }))
       });
 
       logger.info("ENTRADAS SAP payload prepared", {
@@ -1387,6 +1535,13 @@ const processEntradaFiles = async (
         sapDocNum = posted.DocNum;
         sapDocEntry = posted.DocEntry;
 
+        // Update the persisted rows with the SAP document number
+        await postgresClient.updateEntradaMercanciaDocNum(
+          parsedEntrada.serieTicket,
+          parsedEntrada.numeroTicket,
+          posted.DocNum
+        );
+
         logger.info("ENTRADAS inventory entry synced to SAP", {
           fileName: downloadedFile.fileName,
           storeNumber,
@@ -1401,10 +1556,6 @@ const processEntradaFiles = async (
       }
 
       if (sapSuccess) {
-        if (shouldMoveToOk) {
-          await sftpService.moveEntradaFileToOk(downloadedFile.fileName);
-          movedToOk = true;
-        }
         processedFiles.push(downloadedFile.fileName);
       }
 
@@ -1495,7 +1646,7 @@ const processEntradaFiles = async (
 
 const processInventoryFlowsInFullIntegration = async (
   sftpService: MicrosSftpService,
-  sqlServerClient: SqlServerClient,
+  postgresClient: PostgresClient,
   sapClient: SapServiceLayerClient,
   middlewareClient: MiddlewareDbClient,
   runId: number,
@@ -1503,26 +1654,21 @@ const processInventoryFlowsInFullIntegration = async (
 ): Promise<void> => {
   const entradaFiles = await processEntradaFiles(
     sftpService,
-    sqlServerClient,
+    postgresClient,
     sapClient,
     middlewareClient,
     runId,
-    range,
-    { moveToOk: false }
+    range
   );
   const consumoFiles = await processConsumoFiles(
     sftpService,
-    sqlServerClient,
+    postgresClient,
     sapClient,
     middlewareClient,
     runId,
     range,
     { moveToOk: false }
   );
-
-  for (const fileName of entradaFiles) {
-    await sftpService.moveEntradaFileToOk(fileName);
-  }
 
   for (const fileName of consumoFiles) {
     await sftpService.moveConsumoFileToOk(fileName);
@@ -1535,11 +1681,11 @@ export const processPendingInvoicesInSapOnce = async (
   triggerMode: "cron" | "manual" = "manual"
 ): Promise<void> => {
   const range = resolveProcessingDateRange(startDateInput, endDateInput);
-  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const postgresClient = new PostgresClient(appConfig.postgres);
   const sapClient = new SapServiceLayerClient(appConfig.sap);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
     logger.info("SAP sync skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1553,10 +1699,10 @@ export const processPendingInvoicesInSapOnce = async (
   });
 
   startLoggerInactivityWatchdog(180000, "manual-sap-sync");
-  await sqlServerClient.connect();
+  await postgresClient.connect();
 
   try {
-    await syncPendingSalesToSap(sqlServerClient, sapClient, middlewareClient, runId, range);
+    await syncPendingSalesToSap(postgresClient, sapClient, middlewareClient, runId, range);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
@@ -1566,7 +1712,7 @@ export const processPendingInvoicesInSapOnce = async (
     try {
       await sapClient.logout();
     } finally {
-      await sqlServerClient.disconnect();
+      await postgresClient.disconnect();
       await middlewareClient.disconnect().catch(() => {});
     }
   }
@@ -1579,10 +1725,10 @@ export const processMicrosFilesOnce = async (
 ): Promise<void> => {
   const range = resolveProcessingDateRange(startDateInput, endDateInput);
   const sftpService = new MicrosSftpService(appConfig.sftp);
-  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const postgresClient = new PostgresClient(appConfig.postgres);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
     logger.info("MICROS ingest skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1596,17 +1742,17 @@ export const processMicrosFilesOnce = async (
   });
 
   startLoggerInactivityWatchdog(180000, "manual-sync");
-  await sqlServerClient.connect();
+  await postgresClient.connect();
 
   try {
-    await ingestMicrosExports(sftpService, sqlServerClient, middlewareClient, runId, range);
+    await ingestMicrosExports(sftpService, postgresClient, middlewareClient, runId, range);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
     throw error;
   } finally {
     stopLoggerInactivityWatchdog();
-    await sqlServerClient.disconnect();
+    await postgresClient.disconnect();
     await middlewareClient.disconnect().catch(() => {});
   }
 };
@@ -1618,11 +1764,11 @@ export const runFullIntegrationOnce = async (
 ): Promise<void> => {
   const range = resolveProcessingDateRange(startDateInput, endDateInput);
   const sftpService = new MicrosSftpService(appConfig.sftp);
-  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const postgresClient = new PostgresClient(appConfig.postgres);
   const sapClient = new SapServiceLayerClient(appConfig.sap);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
     logger.info("Full integration skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1636,12 +1782,20 @@ export const runFullIntegrationOnce = async (
   });
 
   startLoggerInactivityWatchdog(180000, "manual-full-sync");
-  await sqlServerClient.connect();
+  await postgresClient.connect();
 
   try {
-    await ingestMicrosExports(sftpService, sqlServerClient, middlewareClient, runId, range);
-    await processInventoryFlowsInFullIntegration(sftpService, sqlServerClient, sapClient, middlewareClient, runId, range);
-    await syncPendingSalesToSap(sqlServerClient, sapClient, middlewareClient, runId, range);
+    await ingestMicrosExports(sftpService, postgresClient, middlewareClient, runId, range);
+    if (appConfig.fullSyncEnableSapUpload) {
+      await processInventoryFlowsInFullIntegration(sftpService, postgresClient, sapClient, middlewareClient, runId, range);
+      await syncPendingSalesToSap(postgresClient, sapClient, middlewareClient, runId, range);
+    } else {
+      logger.info("Full integration skipped SAP document upload because FULL_SYNC_ENABLE_SAP_UPLOAD is disabled", {
+        runId,
+        startDate: range.startDate,
+        endDate: range.endDate
+      });
+    }
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
@@ -1651,23 +1805,20 @@ export const runFullIntegrationOnce = async (
     try {
       await sapClient.logout();
     } finally {
-      await sqlServerClient.disconnect();
+      await postgresClient.disconnect();
       await middlewareClient.disconnect().catch(() => {});
     }
   }
 };
 
 export const processPedidosFilesOnce = async (
-  startDateInput?: string | Date,
-  endDateInput?: string | Date,
   triggerMode: "cron" | "manual" = "manual"
 ): Promise<void> => {
-  const range = resolveProcessingDateRange(startDateInput, endDateInput);
   const sftpService = new MicrosSftpService(appConfig.sftp);
   const pedidoApiClient = new PedidoApiClient(appConfig.pedidosApi);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(PEDIDOS_JOB_LOCK_NAME))) {
     logger.info("PEDIDOS upload skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1675,15 +1826,13 @@ export const processPedidosFilesOnce = async (
 
   const runId = await middlewareClient.createRun({
     jobType: "pedido_upload",
-    triggerMode,
-    dateRangeStart: range.startDate,
-    dateRangeEnd: range.endDate
+    triggerMode
   });
 
   startLoggerInactivityWatchdog(180000, "manual-pedido-sync");
 
   try {
-    await processPedidoFiles(sftpService, pedidoApiClient, middlewareClient, runId, range);
+    await processPedidoFiles(sftpService, pedidoApiClient, middlewareClient, runId);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
@@ -1702,10 +1851,10 @@ export const processConsumosFilesOnce = async (
   const range = resolveProcessingDateRange(startDateInput, endDateInput);
   const sftpService = new MicrosSftpService(appConfig.sftp);
   const sapClient = new SapServiceLayerClient(appConfig.sap);
-  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const postgresClient = new PostgresClient(appConfig.postgres);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
     logger.info("CONSUMOS upload skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1719,10 +1868,10 @@ export const processConsumosFilesOnce = async (
   });
 
   startLoggerInactivityWatchdog(180000, "manual-consumo-sync");
-  await sqlServerClient.connect();
+  await postgresClient.connect();
 
   try {
-    await processConsumoFiles(sftpService, sqlServerClient, sapClient, middlewareClient, runId, range);
+    await processConsumoFiles(sftpService, postgresClient, sapClient, middlewareClient, runId, range);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
@@ -1732,7 +1881,7 @@ export const processConsumosFilesOnce = async (
     try {
       await sapClient.logout();
     } finally {
-      await sqlServerClient.disconnect();
+      await postgresClient.disconnect();
       await middlewareClient.disconnect().catch(() => {});
     }
   }
@@ -1746,10 +1895,10 @@ export const processEntradasFilesOnce = async (
   const range = resolveProcessingDateRange(startDateInput, endDateInput);
   const sftpService = new MicrosSftpService(appConfig.sftp);
   const sapClient = new SapServiceLayerClient(appConfig.sap);
-  const sqlServerClient = new SqlServerClient(appConfig.sqlServer);
+  const postgresClient = new PostgresClient(appConfig.postgres);
   const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
 
-  if (!(await middlewareClient.tryAcquireJobLock("micros_simphony_etl"))) {
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
     logger.info("ENTRADAS upload skipped because another execution is already running");
     await middlewareClient.disconnect();
     return;
@@ -1763,10 +1912,10 @@ export const processEntradasFilesOnce = async (
   });
 
   startLoggerInactivityWatchdog(180000, "manual-entrada-sync");
-  await sqlServerClient.connect();
+  await postgresClient.connect();
 
   try {
-    await processEntradaFiles(sftpService, sqlServerClient, sapClient, middlewareClient, runId, range);
+    await processEntradaFiles(sftpService, postgresClient, sapClient, middlewareClient, runId, range);
     await middlewareClient.finishRun(runId, "success");
   } catch (error) {
     await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
@@ -1776,7 +1925,258 @@ export const processEntradasFilesOnce = async (
     try {
       await sapClient.logout();
     } finally {
-      await sqlServerClient.disconnect();
+      await postgresClient.disconnect();
+      await middlewareClient.disconnect().catch(() => {});
+    }
+  }
+};
+
+export const downloadPedidosFilesOnce = async (
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+
+  if (!(await middlewareClient.tryAcquireJobLock(PEDIDOS_JOB_LOCK_NAME))) {
+    logger.info("PEDIDOS download skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "pedido_upload",
+    triggerMode
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-pedido-download");
+
+  try {
+    const downloadedFiles = await sftpService.downloadPedidoFiles();
+    logger.info("PEDIDOS files downloaded for later operation", { count: downloadedFiles.length });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    await middlewareClient.disconnect().catch(() => {});
+  }
+};
+
+export const uploadPedidosFilesOnce = async (
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const pedidoApiClient = new PedidoApiClient(appConfig.pedidosApi);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+  const pedidoFlowPaths = resolvePedidosFlowPaths();
+
+  if (!(await middlewareClient.tryAcquireJobLock(PEDIDOS_JOB_LOCK_NAME))) {
+    logger.info("PEDIDOS upload skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "pedido_upload",
+    triggerMode
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-pedido-upload");
+
+  try {
+    const localFiles = await listLocalDownloadedPedidoFiles({
+      localDir: pedidoFlowPaths.localDir,
+      remoteDir: pedidoFlowPaths.remoteDir
+    });
+    await processPedidoFiles(sftpService, pedidoApiClient, middlewareClient, runId, { downloadedFiles: localFiles });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    await middlewareClient.disconnect().catch(() => {});
+  }
+};
+
+export const downloadConsumosFilesOnce = async (
+  startDateInput?: string | Date,
+  endDateInput?: string | Date,
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const range = resolveProcessingDateRange(startDateInput, endDateInput);
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
+    logger.info("CONSUMOS download skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "consumo_upload",
+    triggerMode,
+    dateRangeStart: range.startDate,
+    dateRangeEnd: range.endDate
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-consumo-download");
+
+  try {
+    const downloadedFiles = await sftpService.downloadConsumoFiles({ startDate: range.startDate, endDate: range.endDate });
+    logger.info("CONSUMOS files downloaded for later SAP operation", { count: downloadedFiles.length });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    await middlewareClient.disconnect().catch(() => {});
+  }
+};
+
+export const uploadConsumosFilesToSapOnce = async (
+  startDateInput?: string | Date,
+  endDateInput?: string | Date,
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const range = resolveProcessingDateRange(startDateInput, endDateInput);
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const sapClient = new SapServiceLayerClient(appConfig.sap);
+  const postgresClient = new PostgresClient(appConfig.postgres);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+  const consumoFlowPaths = resolveConsumosFlowPaths();
+
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
+    logger.info("CONSUMOS upload skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "consumo_upload",
+    triggerMode,
+    dateRangeStart: range.startDate,
+    dateRangeEnd: range.endDate
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-consumo-upload");
+  await postgresClient.connect();
+
+  try {
+    const localFiles = await listLocalDownloadedFiles({
+      localDir: consumoFlowPaths.localDir,
+      remoteDir: consumoFlowPaths.remoteDir,
+      range,
+      parseFileDate: parseInventoryMovementFileDate,
+      flowName: "CONSUMOS"
+    });
+    await processConsumoFiles(sftpService, postgresClient, sapClient, middlewareClient, runId, range, {
+      downloadedFiles: localFiles
+    });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    try {
+      await sapClient.logout();
+    } finally {
+      await postgresClient.disconnect();
+      await middlewareClient.disconnect().catch(() => {});
+    }
+  }
+};
+
+export const downloadEntradasFilesOnce = async (
+  startDateInput?: string | Date,
+  endDateInput?: string | Date,
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const range = resolveProcessingDateRange(startDateInput, endDateInput);
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
+    logger.info("ENTRADAS download skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "entrada_upload",
+    triggerMode,
+    dateRangeStart: range.startDate,
+    dateRangeEnd: range.endDate
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-entrada-download");
+
+  try {
+    const downloadedFiles = await sftpService.downloadEntradaFiles({ startDate: range.startDate, endDate: range.endDate });
+    logger.info("ENTRADAS files downloaded for later SAP operation", { count: downloadedFiles.length });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    await middlewareClient.disconnect().catch(() => {});
+  }
+};
+
+export const uploadEntradasFilesToSapOnce = async (
+  startDateInput?: string | Date,
+  endDateInput?: string | Date,
+  triggerMode: "cron" | "manual" = "manual"
+): Promise<void> => {
+  const range = resolveProcessingDateRange(startDateInput, endDateInput);
+  const sftpService = new MicrosSftpService(appConfig.sftp);
+  const sapClient = new SapServiceLayerClient(appConfig.sap);
+  const postgresClient = new PostgresClient(appConfig.postgres);
+  const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
+  const entradaFlowPaths = resolveEntradasFlowPaths();
+
+  if (!(await middlewareClient.tryAcquireJobLock(DEFAULT_JOB_LOCK_NAME))) {
+    logger.info("ENTRADAS upload skipped because another execution is already running");
+    await middlewareClient.disconnect();
+    return;
+  }
+
+  const runId = await middlewareClient.createRun({
+    jobType: "entrada_upload",
+    triggerMode,
+    dateRangeStart: range.startDate,
+    dateRangeEnd: range.endDate
+  });
+
+  startLoggerInactivityWatchdog(180000, "manual-entrada-upload");
+  await postgresClient.connect();
+
+  try {
+    const localFiles = await listLocalDownloadedFiles({
+      localDir: entradaFlowPaths.localDir,
+      remoteDir: entradaFlowPaths.remoteDir,
+      range,
+      parseFileDate: parseInventoryMovementFileDate,
+      flowName: "ENTRADAS"
+    });
+    await processEntradaFiles(sftpService, postgresClient, sapClient, middlewareClient, runId, range, {
+      downloadedFiles: localFiles
+    });
+    await middlewareClient.finishRun(runId, "success");
+  } catch (error) {
+    await middlewareClient.finishRun(runId, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  } finally {
+    stopLoggerInactivityWatchdog();
+    try {
+      await sapClient.logout();
+    } finally {
+      await postgresClient.disconnect();
       await middlewareClient.disconnect().catch(() => {});
     }
   }
@@ -1795,7 +2195,7 @@ const runScheduledJob = async (schedule: Pick<JobSchedule, "jobType" | "name">):
         await runFullIntegrationOnce(undefined, undefined, "cron");
         break;
       case "pedido_upload":
-        await processPedidosFilesOnce(undefined, undefined, "cron");
+        await processPedidosFilesOnce("cron");
         break;
       case "consumo_upload":
         await processConsumosFilesOnce(undefined, undefined, "cron");
@@ -1820,8 +2220,8 @@ export const startNightlySyncJob = (): void => {
     const middlewareClient = new MiddlewareDbClient(appConfig.middlewareDb);
     try {
       const databaseSchedules = await middlewareClient.getEnabledJobSchedules();
-      const schedules: JobSchedule[] = databaseSchedules.length > 0
-        ? databaseSchedules
+      const baseSchedules: JobSchedule[] = databaseSchedules.length > 0
+        ? databaseSchedules.filter((schedule) => schedule.jobType !== "pedido_upload")
         : [
             {
               id: 0,
@@ -1829,15 +2229,19 @@ export const startNightlySyncJob = (): void => {
               jobType: "sap_sync",
               cronExpression: appConfig.cronExpression,
               timezone: appConfig.cronTimezone
-            },
-            {
-              id: -1,
-              name: "fallback-pedido-upload",
-              jobType: "pedido_upload",
-              cronExpression: appConfig.cronExpression,
-              timezone: appConfig.cronTimezone
             }
           ];
+
+      const schedules: JobSchedule[] = [
+        ...baseSchedules,
+        {
+          id: -1,
+          name: "fallback-pedido-upload",
+          jobType: "pedido_upload",
+          cronExpression: "*/5 * * * *",
+          timezone: appConfig.cronTimezone
+        }
+      ];
       const activeNames = new Set(schedules.map((schedule) => schedule.name));
 
       for (const [name, scheduled] of scheduledTasks) {

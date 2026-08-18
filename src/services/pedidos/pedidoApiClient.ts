@@ -1,9 +1,12 @@
 import fs from "node:fs/promises";
+import https from "node:https";
+import axios, { type AxiosError } from "axios";
 import { logger } from "../logger.js";
 
 export interface PedidoApiConfig {
   uploadUrl: string;
   timeoutMs: number;
+  allowSelfSignedCert?: boolean;
   debugRequests?: boolean;
 }
 
@@ -30,7 +33,13 @@ export interface PedidoUploadResponse {
 }
 
 export class PedidoApiClient {
-  constructor(private readonly config: PedidoApiConfig) {}
+  private readonly httpsAgent: https.Agent;
+
+  constructor(private readonly config: PedidoApiConfig) {
+    this.httpsAgent = new https.Agent({
+      rejectUnauthorized: !config.allowSelfSignedCert
+    });
+  }
 
   async uploadFile(localPath: string, fileName: string): Promise<PedidoUploadResponse> {
     const content = await fs.readFile(localPath);
@@ -43,14 +52,26 @@ export class PedidoApiClient {
       sizeBytes: content.byteLength
     });
 
-    const response = await fetch(this.config.uploadUrl, {
-      method: "POST",
-      body: form,
-      signal: AbortSignal.timeout(this.config.timeoutMs)
-    });
+    let response;
+    try {
+      response = await axios.post<PedidoUploadResponse>(this.config.uploadUrl, form, {
+        timeout: this.config.timeoutMs,
+        httpsAgent: this.httpsAgent,
+        validateStatus: () => true
+      });
+    } catch (error) {
+      const axiosError = error as AxiosError;
+      const cause = axiosError.cause as NodeJS.ErrnoException | undefined;
+      throw new Error(
+        `Pedido API upload transport failed: ${cause?.code ?? axiosError.code ?? axiosError.message}`,
+        { cause: error }
+      );
+    }
 
-    const rawBody = await response.text();
-    if (!response.ok) {
+    const rawBody = typeof response.data === "string"
+      ? response.data
+      : JSON.stringify(response.data);
+    if (response.status < 200 || response.status >= 300) {
       throw new Error(
         `Pedido API upload failed (${response.status}): ${rawBody.slice(0, 1000)}`
       );
@@ -58,7 +79,7 @@ export class PedidoApiClient {
 
     let payload: unknown;
     try {
-      payload = JSON.parse(rawBody);
+      payload = typeof response.data === "string" ? JSON.parse(rawBody) : response.data;
     } catch {
       throw new Error(`Pedido API returned non-JSON response: ${rawBody.slice(0, 1000)}`);
     }

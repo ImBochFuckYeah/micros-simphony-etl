@@ -45,7 +45,7 @@ export const resolveInventoryFlowPaths = (config: InventoryFlowPaths) => ({
   entradasLocalDir: config.entradasLocalDir ?? config.consumosLocalDir ?? path.join(config.localDir, "CONSUMOS")
 });
 
-const parsePedidoFileDate = (fileName: string): Date | null => {
+export const parsePedidoFileDate = (fileName: string): Date | null => {
   const match = /^PED(\d{4})(\d{2})(\d{2})\d+\.txt$/i.exec(fileName);
   if (!match) {
     return null;
@@ -242,7 +242,7 @@ export class MicrosSftpService {
     }
   }
 
-  async downloadPedidoFiles(range: MicrosExportDateRange): Promise<DownloadedMicrosExport[]> {
+  async downloadPedidoFiles(): Promise<DownloadedMicrosExport[]> {
     await fs.mkdir(this.pedidosLocalDir, { recursive: true });
     await this.connect();
 
@@ -252,29 +252,11 @@ export class MicrosSftpService {
         if (file.type !== "-") {
           return false;
         }
-
-        const fileDate = parsePedidoFileDate(file.name);
-        if (!fileDate) {
-          return false;
-        }
-
-        const parsedStart = new Date(`${range.startDate}T00:00:00`);
-        const parsedEnd = new Date(`${range.endDate}T00:00:00`);
-        if (Number.isNaN(parsedStart.getTime()) || Number.isNaN(parsedEnd.getTime())) {
-          return false;
-        }
-
-        const candidate = new Date(fileDate.getFullYear(), fileDate.getMonth(), fileDate.getDate());
-        return (
-          candidate >= new Date(parsedStart.getFullYear(), parsedStart.getMonth(), parsedStart.getDate()) &&
-          candidate <= new Date(parsedEnd.getFullYear(), parsedEnd.getMonth(), parsedEnd.getDate())
-        );
+        return /\.txt$/i.test(file.name);
       });
 
       logger.info("SFTP PEDIDOS files matched", {
         remoteDir: this.pedidosRemoteDir,
-        startDate: range.startDate,
-        endDate: range.endDate,
         count: files.length,
         sampleFiles: files.slice(0, 25).map((file) => file.name)
       });

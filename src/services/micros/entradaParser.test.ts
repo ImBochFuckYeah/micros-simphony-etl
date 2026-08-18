@@ -19,28 +19,42 @@ test("parseMicrosInventoryEntries maps INVID header and positive receipt lines",
       {
         "Record Type": "INV",
         "IM Inventory Item Code": "BG0018",
-        "Receipt Quantity": 7
+        "Inventory Item Name1": "PALADIN 355ml",
+        "Standard Unit of Measure Name": "Und",
+        "Receipt Quantity": 7,
+        "Receipt Value": 49
       },
       {
         "Record Type": "INV",
         "IM Inventory Item Code": "",
-        "Receipt Quantity": 3
+        "Inventory Item Name1": "EMPTY",
+        "Standard Unit of Measure Name": "Und",
+        "Receipt Quantity": 3,
+        "Receipt Value": 21
       },
       {
         "Record Type": "INV",
         "IM Inventory Item Code": "IN0002",
-        "Receipt Quantity": 0
+        "Inventory Item Name1": "ZERO QTY",
+        "Standard Unit of Measure Name": "Und",
+        "Receipt Quantity": 0,
+        "Receipt Value": 0
       }
     ]
   ];
 
   const parsed = parseMicrosInventoryEntries(sample);
 
+  assert.equal(parsed.serieTicket, "INV-Lab9999");
+  assert.equal(parsed.numeroTicket, 20260803);
   assert.equal(parsed.storeNumber, "Lab9999");
   assert.equal(parsed.firstBusinessDate, "2026-08-03");
   assert.equal(parsed.lastBusinessDate, "2026-08-03");
   assert.equal(parsed.dateCreated, "2026-08-04");
   assert.equal(parsed.lines.length, 1);
-  assert.equal(parsed.lines[0].itemCode, "BG0018");
-  assert.equal(parsed.lines[0].quantity, 7);
+  assert.equal(parsed.lines[0].skuProducto, "BG0018");
+  assert.equal(parsed.lines[0].descripcionProducto, "PALADIN 355ml");
+  assert.equal(parsed.lines[0].unidadMedida, "Und");
+  assert.equal(parsed.lines[0].cantidad, 7);
+  assert.equal(parsed.lines[0].precioUnitario, 49);
 });

@@ -1,4 +1,4 @@
-import type { ConsumoJsonExport, ConsumoRecord, ParsedConsumoDocument, ParsedConsumoLine } from "../../types/consumos.js";
+import type { ConsumoJsonExport, ConsumoRecord, ParsedEntradaDocument, ParsedEntradaLine } from "../../types/consumos.js";
 
 const asString = (value: unknown, fallback = ""): string =>
   typeof value === "string" ? value.trim() : fallback;
@@ -23,6 +23,17 @@ const formatDateOnly = (value: string): string => {
   }
 
   return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+};
+
+/**
+ * Derives a numeric ticket number from a business date string (YYYYMMDD → integer).
+ * Falls back to 0 if the date cannot be parsed.
+ */
+const dateToTicketNumber = (dateStr: string): number => {
+  const digits = dateStr.replace(/\D/g, "");
+  if (digits.length < 8) return 0;
+  const parsed = Number(digits.slice(0, 8));
+  return Number.isFinite(parsed) ? parsed : 0;
 };
 
 const findFirstRecordByType = (groups: ConsumoJsonExport, recordType: string): ConsumoRecord | null => {
@@ -54,21 +65,24 @@ const collectRecordsByType = (groups: ConsumoJsonExport, recordType: string): Co
   return records;
 };
 
-const mapInvRecordToLine = (record: ConsumoRecord): ParsedConsumoLine | null => {
-  const itemCode = asString(record["IM Inventory Item Code"]);
-  const receiptQuantity = Math.abs(asNumber(record["Receipt Quantity"], 0));
+const mapInvRecordToEntradaLine = (record: ConsumoRecord): ParsedEntradaLine | null => {
+  const skuProducto = asString(record["IM Inventory Item Code"]);
+  const cantidad = Math.abs(asNumber(record["Receipt Quantity"], 0));
 
-  if (!itemCode || receiptQuantity <= 0) {
+  if (!skuProducto || cantidad <= 0) {
     return null;
   }
 
   return {
-    itemCode,
-    quantity: receiptQuantity
+    skuProducto,
+    descripcionProducto: asString(record["Inventory Item Name1"]),
+    unidadMedida: asString(record["Standard Unit of Measure Name"]),
+    cantidad,
+    precioUnitario: asNumber(record["Receipt Value"], 0)
   };
 };
 
-export const parseMicrosInventoryEntries = (entradaJson: ConsumoJsonExport): ParsedConsumoDocument => {
+export const parseMicrosInventoryEntries = (entradaJson: ConsumoJsonExport): ParsedEntradaDocument => {
   const invid = findFirstRecordByType(entradaJson, "INVID");
   if (!invid) {
     throw new Error("ENTRADA file does not include an INVID record");
@@ -87,14 +101,22 @@ export const parseMicrosInventoryEntries = (entradaJson: ConsumoJsonExport): Par
   const lastBusinessDateRaw = asString(invid["Last Business Date"] || invid["First Business Date"]);
   const dateCreatedRaw = asString(invid["Date Created"] || invid["First Business Date"]);
 
+  const firstBusinessDate = formatDateOnly(firstBusinessDateRaw);
+
+  // serie_ticket = "INV-<StoreNumber>", numero_ticket = YYYYMMDD as integer
+  const serieTicket = `INV-${storeNumber}`;
+  const numeroTicket = dateToTicketNumber(firstBusinessDateRaw);
+
   const lines = collectRecordsByType(entradaJson, "INV")
-    .map(mapInvRecordToLine)
-    .filter((line): line is ParsedConsumoLine => line !== null);
+    .map(mapInvRecordToEntradaLine)
+    .filter((line): line is ParsedEntradaLine => line !== null);
 
   return {
+    serieTicket,
+    numeroTicket,
     storeNumber,
     storeName: asString(invid["Store Name"]),
-    firstBusinessDate: formatDateOnly(firstBusinessDateRaw),
+    firstBusinessDate,
     lastBusinessDate: formatDateOnly(lastBusinessDateRaw),
     dateCreated: formatDateOnly(dateCreatedRaw),
     lines
