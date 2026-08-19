@@ -63,6 +63,8 @@ npm run manual-full-sync
 `npm run manual-entradas-upload` opera en SAP los archivos descargados localmente de `ENTRADAS`.
 `npm run manual-full-sync` ejecuta una corrida completa: SFTP + parseo + PostgreSQL y, opcionalmente, SAP (sin incluir PEDIDOS).
 
+Cuando un flujo con rango de fechas se ejecuta sin `START_DATE`/`END_DATE`, toma por defecto el dia anterior como `startDate` y `endDate`.
+
 ## Operacion
 
 Antes de desplegar, aplica las migraciones de `data/db/migrations` en orden. La migracion `003_add_delivery_control_and_scheduling.sql` agrega las tablas de control para entregas, alertas y agendas futuras.
