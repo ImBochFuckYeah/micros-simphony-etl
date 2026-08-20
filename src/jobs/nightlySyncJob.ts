@@ -1638,7 +1638,7 @@ export const processPendingInvoicesInSapOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-sap-sync");
+  startLoggerInactivityWatchdog(600000, "manual-sap-sync");
   await postgresClient.connect();
 
   try {
@@ -1721,7 +1721,7 @@ export const runFullIntegrationOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-full-sync");
+  startLoggerInactivityWatchdog(600000, "manual-full-sync");
   await postgresClient.connect();
 
   try {
