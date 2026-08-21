@@ -1681,7 +1681,7 @@ export const processMicrosFilesOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-sync");
+  startLoggerInactivityWatchdog(360000, "manual-sync");
   await postgresClient.connect();
 
   try {
@@ -1769,7 +1769,7 @@ export const processPedidosFilesOnce = async (
     triggerMode
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-pedido-sync");
+  startLoggerInactivityWatchdog(360000, "manual-pedido-sync");
 
   try {
     await processPedidoFiles(sftpService, pedidoApiClient, middlewareClient, runId);
@@ -1807,7 +1807,7 @@ export const processConsumosFilesOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-consumo-sync");
+  startLoggerInactivityWatchdog(360000, "manual-consumo-sync");
   await postgresClient.connect();
 
   try {
@@ -1851,7 +1851,7 @@ export const processEntradasFilesOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-entrada-sync");
+  startLoggerInactivityWatchdog(360000, "manual-entrada-sync");
   await postgresClient.connect();
 
   try {
@@ -1888,7 +1888,7 @@ export const downloadPedidosFilesOnce = async (
     triggerMode
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-pedido-download");
+  startLoggerInactivityWatchdog(360000, "manual-pedido-download");
 
   try {
     const downloadedFiles = await sftpService.downloadPedidoFiles();
@@ -1922,7 +1922,7 @@ export const uploadPedidosFilesOnce = async (
     triggerMode
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-pedido-upload");
+  startLoggerInactivityWatchdog(360000, "manual-pedido-upload");
 
   try {
     const localFiles = await listLocalDownloadedPedidoFiles({
@@ -1962,7 +1962,7 @@ export const downloadConsumosFilesOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-consumo-download");
+  startLoggerInactivityWatchdog(360000, "manual-consumo-download");
 
   try {
     const downloadedFiles = await sftpService.downloadConsumoFiles({ startDate: range.startDate, endDate: range.endDate });
@@ -2002,7 +2002,7 @@ export const uploadConsumosFilesToSapOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-consumo-upload");
+  startLoggerInactivityWatchdog(360000, "manual-consumo-upload");
   await postgresClient.connect();
 
   try {
@@ -2053,7 +2053,7 @@ export const downloadEntradasFilesOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-entrada-download");
+  startLoggerInactivityWatchdog(360000, "manual-entrada-download");
 
   try {
     const downloadedFiles = await sftpService.downloadEntradaFiles({ startDate: range.startDate, endDate: range.endDate });
@@ -2093,7 +2093,7 @@ export const uploadEntradasFilesToSapOnce = async (
     dateRangeEnd: range.endDate
   });
 
-  startLoggerInactivityWatchdog(180000, "manual-entrada-upload");
+  startLoggerInactivityWatchdog(360000, "manual-entrada-upload");
   await postgresClient.connect();
 
   try {
